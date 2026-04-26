@@ -1,0 +1,35 @@
+# Gene 元数据模板
+# 由 extract-gene.sh 生成新 Gene 时使用
+# 格式：扁平 key:value 键值对，列表用逗号分隔
+
+# --- 标识 ---
+gene_id: GEN-YYYYMMDD-XXX
+name: gene-name-here
+description: "[TODO: 描述这个 Gene 封装的可复用方法/做法]"
+
+# --- 谱系 ---
+parent_gene: ""
+forked_from: ""
+
+# --- 版本 ---
+current_version: v1
+variant_count: 1
+
+# --- 指标 ---
+effectiveness_score: 0.5
+usage_count: 0
+last_used: ""
+created: YYYY-MM-DDTHH:MM:SSZ
+
+# --- 衰减 ---
+freshness_score: 1.0
+decay_status: active
+decay_window_days: 90
+
+# --- 来源 ---
+source_type: learning
+source_learning_ids: ""
+
+# --- 上下文 ---
+context_tags: ""
+applicable_areas: ""

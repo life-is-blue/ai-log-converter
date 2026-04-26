@@ -1,0 +1,1 @@
+ai-logs/SOUL.md

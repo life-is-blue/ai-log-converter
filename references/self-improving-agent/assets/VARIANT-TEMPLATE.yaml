@@ -1,0 +1,23 @@
+# Gene 变体模板
+# 每个变体是一个 Gene 的"表达版本"
+# 存放于 .genes/<gene-name>/variants/vN.yaml
+
+version: v1
+created: YYYY-MM-DDTHH:MM:SSZ
+author: initial
+supersedes: ""
+
+summary: "[TODO: 一行描述此变体的方法/做法]"
+
+approach: |
+  [TODO: 分步方法论]
+  1. 第一步
+  2. 第二步
+  3. 第三步
+
+example: |
+  [TODO: 可选的代码或使用示例]
+
+trigger: "[TODO: 何时应用此变体]"
+source_learning_id: ""
+notes: ""

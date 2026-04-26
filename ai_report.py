@@ -1,0 +1,1090 @@
+#!/usr/bin/env python3
+"""
+ai_report.py — LLM-powered daily report + soul model builder.
+
+Usage:
+  python3 ai_report.py report [--date YYYY-MM-DD] [--logs DIR]
+  python3 ai_report.py soul [--since YYYY-MM-DD] [--logs DIR] [--soul FILE]
+  python3 ai_report.py push [--logs DIR]
+
+Env vars:
+  LLM_API_KEY           API key (required for report/soul)
+  LLM_BASE_URL          OpenAI-compatible endpoint (default: https://api.openai.com/v1)
+  LLM_MODEL_NAME        Model name (default: gpt-4o-mini)
+  LLM_MAX_TOKENS        Max tokens for LLM response (default: 2000)
+  WECOM_WEBHOOK_URL     WeCom group robot webhook (optional, for push)
+  AI_LOGS_DIR           Log directory (default: ./ai-logs)
+"""
+import argparse, json, os, re, subprocess, sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+
+from ai_engine import load_dotenv, call_engine, _codex_available
+from ai_prompts import (
+    REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
+    LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON,
+)
+
+
+load_dotenv()
+
+
+def _ts_to_date(ts) -> date | None:
+    """Parse meta.timestamp (int millis/seconds or ISO string) to a local-time date."""
+    if ts is None or isinstance(ts, bool):
+        return None
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts / 1000 if ts >= 1e12 else ts).date()
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()  # convert UTC/aware → local before taking date
+        return dt.date()
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def session_days(path: Path) -> set[date]:
+    """Every local date with at least one message. Mtime fallback if no timestamps found."""
+    days: set[date] = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                d = _ts_to_date((obj.get("meta") or {}).get("timestamp"))
+                if d:
+                    days.add(d)
+    except OSError:
+        pass
+    if not days:
+        try:
+            days.add(datetime.fromtimestamp(path.stat().st_mtime).date())
+        except OSError:
+            pass
+    return days
+
+
+def find_sessions(logs_dir: Path, target_date: date = None) -> list[Path]:
+    results = []
+    for p in sorted(logs_dir.rglob("*.jsonl")):
+        if "reports" in p.parts:
+            continue
+        if target_date and target_date not in session_days(p):
+            continue
+        results.append(p)
+    return results
+
+
+def extract_turns(path: Path, max_chars: int = 2000, target_date: date = None, tail: bool = False) -> str:
+    turns, total = [], 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            all_entries = []
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                role = obj.get("role", "")
+                if role not in ("user", "assistant"):
+                    continue
+                if target_date is not None:
+                    d = _ts_to_date((obj.get("meta") or {}).get("timestamp"))
+                    if d != target_date:
+                        continue
+                content = obj.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(i.get("text", "") for i in content if i.get("type") == "text")
+                if not isinstance(content, str):  # defensive: handles null/int in malformed JSONL
+                    continue
+                # User turns get full 500 chars; assistant truncated to 200
+                # User intent is the gold signal for both reports and soul modeling
+                limit = 500 if role == "user" else 200
+                entry = f"[{role}] {content[:limit]}"
+                if tail:
+                    all_entries.append(entry)
+                else:
+                    total += len(entry)
+                    turns.append(entry)
+                    if total > max_chars:
+                        break
+    except OSError:
+        return ""
+    if tail:
+        # Take last N entries that fit within max_chars (bug fixes tend to be at tail)
+        result, total = [], 0
+        for entry in reversed(all_entries):
+            total += len(entry)
+            if total > max_chars:
+                break
+            result.append(entry)
+        return "\n".join(reversed(result))
+    return "\n".join(turns)
+
+
+
+def quality_gate(observations: str) -> str:
+    """Filter out low-signal observation bullets. Returns empty string if nothing survives."""
+    REJECT_PATTERNS = [
+        r"数据不足", r"无实质性", r"无法提取", r"样本有限",
+        r"仅包含.*?/clear", r"仅包含.*?/resume", r"无实质性交互",
+        r"需要更多.*?消息才能构建", r"(?:推测|初步判断|大概率)(?:使用|为|是)",
+    ]
+    lines = observations.strip().splitlines()
+    kept = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            kept.append(line)
+            continue
+        if any(re.search(p, stripped) for p in REJECT_PATTERNS):
+            continue
+        # Bullets with <8 chars of actual content after stripping bold markers are noise
+        text = re.sub(r"\*\*.*?\*\*[：:]?\s*", "", stripped.lstrip("- "))
+        if len(text) < 8:
+            continue
+        kept.append(line)
+    # If no bullet points survived, return empty
+    if not any(l.strip().startswith("-") for l in kept):
+        return ""
+    return "\n".join(kept).strip()
+
+
+def grounding_check(observations: str, user_turns: str) -> str:
+    """LLM-as-judge: verify each observation bullet is grounded in actual user messages.
+    Returns only GROUNDED bullets. Empty string if nothing survives.
+    Pattern-key tags (<!-- pk: xxx -->) are stripped before grounding and re-attached after."""
+    if not observations.strip() or not user_turns.strip():
+        return ""
+
+    # LLM fallback (small context) can't handle unbounded user_turns —
+    # grounding requires observations + user_turns in one atomic call.
+    # Codex exec (128K) handles full context; fallback truncates to 20K.
+    if not _codex_available() and len(user_turns) > 20000:
+        print(f"Grounding: user_turns truncated from {len(user_turns)} to 20000 (LLM fallback)", file=sys.stderr)
+        user_turns = user_turns[:20000]
+
+    # Strip pk tags before sending to grounding LLM — LLMs unreliably preserve HTML comments
+    pk_re = re.compile(r'\s*<!--\s*pk:\s*[\w-]+\s*-->')
+    pk_map = {}  # normalized bullet text → pk tag
+    clean_lines = []
+    for line in observations.strip().splitlines():
+        pk_match = re.search(r'(<!--\s*pk:\s*[\w-]+\s*-->)', line)
+        if pk_match and line.strip().startswith("-"):
+            clean_text = pk_re.sub('', line).strip()
+            norm_key = re.sub(r'\*\*.*?\*\*[：:]?\s*', '', clean_text.lstrip("- ")).strip()
+            pk_map[norm_key] = pk_match.group(1)
+            clean_lines.append(clean_text)
+        else:
+            clean_lines.append(line)
+    clean_obs = "\n".join(clean_lines)
+
+    prompt = f"## 观察\n\n{clean_obs}\n\n## 用户原始消息\n\n{user_turns}"
+    verdict = call_engine(prompt, GROUNDING_SYSTEM)
+    if not verdict:
+        print("Grounding: LLM returned empty response (possible API refusal)", file=sys.stderr)
+        return ""
+    kept = []
+    for line in verdict.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("GROUNDED:"):
+            bullet = line[len("GROUNDED:"):].strip()
+            if bullet:
+                # Normalize: ensure single leading "- ", preserve content after it
+                bullet = bullet.lstrip("-").lstrip()
+                kept.append(f"- {bullet}")
+        elif line.startswith("FABRICATED:"):
+            print(f"Grounding rejected: {line[:100]}", file=sys.stderr)
+        else:
+            print(f"Grounding: unparseable judge line: {line[:80]}", file=sys.stderr)
+
+    # Re-attach pk tags to surviving bullets
+    for i, kept_line in enumerate(kept):
+        bullet_text = re.sub(r'\*\*.*?\*\*[：:]?\s*', '', kept_line.lstrip("- ")).strip()
+        for orig_norm, pk_tag in pk_map.items():
+            if orig_norm in bullet_text or bullet_text in orig_norm:
+                kept[i] = f"{kept_line} {pk_tag}"
+                break
+
+    if not kept:
+        return ""
+    return "\n".join(kept)
+
+
+def observe_with_chunking(chunks: list[str]) -> str:
+    """LLM observe — call_engine handles context limits internally."""
+    combined = "\n\n---\n\n".join(chunks)
+    return call_engine(combined, SOUL_SYSTEM)
+
+
+def parse_lesson_entries(raw: str, target_date) -> list[dict]:
+    """Parse LLM output into structured lesson entries.
+    Each entry must have ## slug header + **坑**/**因**/**法** triple."""
+    entries = []
+    parts = re.split(r'(?=^## [\w-]+$)', raw.strip(), flags=re.M)
+    for part in parts:
+        part = part.strip()
+        if not part.startswith("## "):
+            continue
+        m = re.match(r'^## ([\w-]+)\s*$', part.splitlines()[0])
+        if not m:
+            continue
+        slug = m.group(1)
+        # Triple validation: all three fields required (Codex review feedback)
+        missing = [f for f in ("**坑**", "**因**", "**法**") if f not in part]
+        if missing:
+            print(f"Lessons: skipping {slug}, missing: {', '.join(missing)}", file=sys.stderr)
+            continue
+        # Fix date line: match "> anything | pk:" pattern precisely
+        text = re.sub(
+            r'^>\s*\d{4}-\d{2}-\d{2}\s*\|',
+            f'> {target_date} |',
+            part, count=1, flags=re.M
+        )
+        entries.append({"slug": slug, "text": text})
+    return entries
+
+
+def lessons_quality_gate(entries: list[dict]) -> list[dict]:
+    """Mechanical filter for lesson entries — reject speculative or vague content."""
+    REJECT_PATTERNS = [
+        r"(?:推测|可能|大概|也许|似乎)(?:是|为|存在|导致)",
+        r"(?:暂未验证|待确认|不确定)",
+    ]
+    kept = []
+    for entry in entries:
+        text = entry["text"]
+        if any(re.search(p, text) for p in REJECT_PATTERNS):
+            print(f"Lessons quality gate rejected: {entry['slug']}", file=sys.stderr)
+            continue
+        kept.append(entry)
+    return kept
+
+
+
+def cmd_lessons(args):
+    """Extract lessons learned from sessions into LESSONS.md."""
+    logs_dir = Path(args.logs)
+    lessons_path = Path(args.lessons)
+    target_date = args.date or (date.today() - timedelta(days=1))
+
+    sessions = find_sessions(logs_dir, target_date)
+    if not sessions:
+        print(f"No sessions for {target_date}", file=sys.stderr); return
+
+    # Collect full day content — call_engine handles context limits
+    chunks = []
+    for s in sessions:
+        excerpt = extract_turns(s, max_chars=200000, target_date=target_date)
+        if excerpt:
+            chunks.append(excerpt)
+    if not chunks:
+        print(f"No extractable content for {target_date}", file=sys.stderr); return
+
+    combined = "\n\n---\n\n".join(chunks)
+    system = LESSONS_SYSTEM.format(date=target_date)
+    print(f"Lessons: {len(combined)//1024}KB input", file=sys.stderr)
+    raw = call_engine(combined, system)
+
+    if not raw or raw.strip() == "NONE":
+        print(f"No lessons for {target_date}", file=sys.stderr); return
+
+    entries = parse_lesson_entries(raw, target_date)
+    entries = lessons_quality_gate(entries)
+    if not entries:
+        print(f"No valid lesson entries for {target_date}", file=sys.stderr); return
+
+    # Dedup: skip entries whose slug already exists
+    existing_slugs = set()
+    if lessons_path.exists():
+        for m in re.finditer(r'^## ([\w-]+)$', lessons_path.read_text(encoding="utf-8"), re.M):
+            existing_slugs.add(m.group(1))
+
+    new_entries = [e for e in entries if e["slug"] not in existing_slugs]
+    if not new_entries:
+        print(f"All lessons for {target_date} already exist", file=sys.stderr); return
+
+    # Write
+    if not lessons_path.exists():
+        lessons_path.write_text(LESSONS_SKELETON.format(date=target_date, count=0), encoding="utf-8")
+    content = lessons_path.read_text(encoding="utf-8")
+
+    for entry in new_entries:
+        # Insert absorbed:false marker after ## slug line
+        text = re.sub(r'^(## [\w-]+)\n', r'\1\n<!-- absorbed: false -->\n', entry["text"], count=1, flags=re.M)
+        content += f"\n{text}\n"
+
+    # Update metadata
+    entry_count = len(re.findall(r'^## [\w-]+$', content, re.M))
+    content = re.sub(r'Entries: \d+', f'Entries: {entry_count}', content)
+    content = re.sub(r'Last updated: \S+', f'Last updated: {target_date}', content)
+
+    lessons_path.write_text(content, encoding="utf-8")
+    print(f"OK {lessons_path} (+{len(new_entries)} lessons for {target_date})", file=sys.stderr)
+
+
+def cmd_report(args):
+    logs_dir = Path(args.logs)
+    target_date = args.date or (date.today() - timedelta(days=1))
+    sessions = find_sessions(logs_dir, target_date)
+    reports_dir = logs_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out_path = reports_dir / f"{target_date}.md"
+    if not sessions:
+        out_path.write_text(f"# {target_date}\n\n无 AI 会话记录。\n", encoding="utf-8")
+        print(f"OK {out_path}", file=sys.stderr); return
+    # Compute structured stats from session paths
+    tool_counts, project_counts = {}, {}
+    for s in sessions:
+        try:
+            rel = s.relative_to(logs_dir).parts
+            tool, project = rel[0], rel[1] if len(rel) > 1 else "unknown"
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            project_counts[project] = project_counts.get(project, 0) + 1
+        except (ValueError, IndexError):
+            pass
+    stats = f"## 精确统计（请直接引用，不要估算）\n\n"
+    stats += f"**总 session 数: {len(sessions)}**\n\n"
+    stats += "| 工具 | session 数 |\n|------|----------|\n"
+    for t, c in sorted(tool_counts.items(), key=lambda x: -x[1]):
+        stats += f"| {t} | {c} |\n"
+    stats += "\n| 项目 | session 数 |\n|------|----------|\n"
+    for p, c in sorted(project_counts.items(), key=lambda x: -x[1]):
+        stats += f"| {p} | {c} |\n"
+
+    parts = []
+    for s in sessions:
+        try:
+            tool = s.relative_to(logs_dir).parts[0]
+        except (ValueError, IndexError):
+            tool = "unknown"
+        parts.append(f"## {tool}: {s.stem}\n{extract_turns(s, max_chars=4000, target_date=target_date)}")
+    result = call_engine(f"Date: {target_date}\n\n{stats}\n\n## 会话详情\n\n" + "\n\n".join(parts), REPORT_SYSTEM)
+    out_path.write_text(f"# {target_date}\n\n{result}\n", encoding="utf-8")
+    print(f"OK {out_path}", file=sys.stderr)
+
+
+def cmd_soul(args):
+    logs_dir, soul_path = Path(args.logs), Path(args.soul)
+    target_date = args.date  # None means "today's batch mode" (existing behavior)
+
+    if target_date:
+        # Date-specific mode: extract observations for one specific day
+        sessions = find_sessions(logs_dir, target_date)
+        if not sessions:
+            print(f"No sessions for {target_date}", file=sys.stderr); return
+        chunks = []
+        for s in sessions:
+            excerpt = extract_turns(s, max_chars=200000, target_date=target_date)
+            if excerpt:
+                chunks.append(excerpt)
+        if not chunks:
+            print(f"No extractable content for {target_date}", file=sys.stderr); return
+        observations = observe_with_chunking(chunks)
+        observations = quality_gate(observations)
+        if not observations:
+            print(f"Observations for {target_date} rejected by quality gate", file=sys.stderr); return
+        # Layer 2: LLM grounding check — collect user turns with larger budget
+        # Use 8000 mixed budget so ~4000 user-only chars survive filtering
+        user_turns_text = ""
+        for s in sessions:
+            turns = extract_turns(s, max_chars=200000, target_date=target_date)
+            user_turns_text += "\n".join(l for l in turns.splitlines() if l.startswith("[user]")) + "\n"
+        observations = grounding_check(observations, user_turns_text)
+        if not observations:
+            print(f"Observations for {target_date} rejected by grounding check", file=sys.stderr); return
+        entry_date = target_date
+    else:
+        # Existing batch mode (unchanged logic)
+        today = date.today()
+        if args.since:
+            since_date = args.since
+        elif soul_path.exists():
+            since_date = datetime.fromtimestamp(soul_path.stat().st_mtime).date()
+        else:
+            since_date = date(2020, 1, 1)
+        sessions = [s for s in find_sessions(logs_dir)
+                    if max(session_days(s), default=date.min) >= since_date]
+        if not sessions:
+            print(f"No new sessions since {since_date}", file=sys.stderr); return
+        chunks, total = [], 0
+        for s in sessions:
+            excerpt = extract_turns(s, max_chars=200000)
+            if not excerpt:
+                continue
+            chunks.append(excerpt)
+            total += len(excerpt)
+            if total > 500000:  # soft cap for map-reduce across sessions
+                break
+        if not chunks:
+            print("No extractable content from sessions", file=sys.stderr); return
+        observations = observe_with_chunking(chunks)
+        observations = quality_gate(observations)
+        if not observations:
+            print("Observations rejected by quality gate", file=sys.stderr); return
+        # Layer 2: LLM grounding check — collect user turns with larger budget
+        user_turns_text = ""
+        for s in sessions:
+            turns = extract_turns(s, max_chars=200000)
+            user_turns_text += "\n".join(l for l in turns.splitlines() if l.startswith("[user]")) + "\n"
+        observations = grounding_check(observations, user_turns_text)
+        if not observations:
+            print("Observations rejected by grounding check", file=sys.stderr); return
+        entry_date = today
+
+    # Count actual jsonl files on disk
+    file_count = sum(1 for _ in logs_dir.rglob("*.jsonl") if "reports" not in _.parts)
+
+    if not soul_path.exists():
+        soul_path.write_text(SOUL_SKELETON.format(date=entry_date, count=file_count), encoding="utf-8")
+    content = soul_path.read_text(encoding="utf-8")
+
+    # Update metadata
+    content = re.sub(r"Sessions:.*", f"Sessions: {file_count} files", content)
+    content = re.sub(r"Last updated:.*", f"Last updated: {entry_date}", content)
+    # Legacy format cleanup: remove "Sessions processed: N" if present
+    content = re.sub(r"> Sessions processed: \d+\n", "", content)
+
+    # Dedup: replace entry_date's entry if it exists, otherwise append
+    date_header = f"\n### {entry_date}\n"
+    entry = f"{date_header}<!-- absorbed: false -->\n\n{observations}\n"
+    if date_header in content:
+        segments = re.split(r'(?=\n### \d{4}-\d{2}-\d{2}\n)', content)
+        content = "".join(s for s in segments if not s.startswith(date_header)) + entry
+    else:
+        content += entry
+
+    soul_path.write_text(content, encoding="utf-8")
+    print(f"OK {soul_path} ({entry_date}, +{len(sessions)} sessions)", file=sys.stderr)
+
+
+def extract_unabsorbed(soul_path: Path) -> list[tuple[str, str]]:
+    """Parse SOUL.md, return [(date_str, observation_text)] for unabsorbed entries."""
+    if not soul_path.exists():
+        return []
+    content = soul_path.read_text(encoding="utf-8")
+    entries = re.split(r'(?=\n### \d{4}-\d{2}-\d{2}\n)', content)
+    result = []
+    for entry in entries:
+        m = re.match(r'\n### (\d{4}-\d{2}-\d{2})\n', entry)
+        if not m:
+            continue
+        if "<!-- absorbed: true -->" in entry:
+            continue
+        date_str = m.group(1)
+        # Strip the header and absorbed marker
+        text = re.sub(r'^.*?-->\s*', '', entry[m.end():], count=1, flags=re.DOTALL).strip()
+        if not text:
+            text = entry[m.end():].strip()
+        if text:
+            result.append((date_str, text))
+    return result
+
+
+def extract_pattern_counts(soul_path: Path, lessons_path: Path | None = None) -> dict[str, int]:
+    """Parse SOUL.md + LESSONS.md, count unique dates per pattern-key.
+
+    Returns dict mapping pattern-key → number of distinct dates it appeared on.
+    This mechanical count replaces unreliable LLM self-counting.
+    """
+    pk_dates: dict[str, set[str]] = {}
+    pk_re = re.compile(r'<!--\s*pk:\s*([\w-]+)\s*-->')
+
+    # --- SOUL.md: date sections with pk-tagged bullets ---
+    if soul_path.exists():
+        content = soul_path.read_text(encoding="utf-8")
+        entries = re.split(r'(?=\n### \d{4}-\d{2}-\d{2}\n)', content)
+        for entry in entries:
+            m = re.match(r'\n### (\d{4}-\d{2}-\d{2})\n', entry)
+            if not m:
+                continue
+            date_str = m.group(1)
+            for pk_match in pk_re.finditer(entry):
+                key = pk_match.group(1)
+                pk_dates.setdefault(key, set()).add(date_str)
+
+    # --- LESSONS.md: each entry has `> YYYY-MM-DD | pk: xxx` ---
+    if lessons_path and lessons_path.exists():
+        content = lessons_path.read_text(encoding="utf-8")
+        lesson_entries = re.split(r'(?=^## [\w-])', content, flags=re.M)
+        date_pk_re = re.compile(r'>\s*(\d{4}-\d{2}-\d{2})\s*\|\s*pk:\s*([\w-]+)')
+        for entry in lesson_entries:
+            m = date_pk_re.search(entry)
+            if m:
+                pk_dates.setdefault(m.group(2), set()).add(m.group(1))
+
+    return {k: len(v) for k, v in sorted(pk_dates.items(), key=lambda x: -len(x[1]))}
+
+
+def mark_absorbed(soul_path: Path, dates: list[str]):
+    """Mark observation entries as absorbed in SOUL.md."""
+    if not soul_path.exists():
+        return
+    content = soul_path.read_text(encoding="utf-8")
+    for d in dates:
+        content = content.replace(
+            f"### {d}\n<!-- absorbed: false -->",
+            f"### {d}\n<!-- absorbed: true -->"
+        )
+    soul_path.write_text(content, encoding="utf-8")
+
+
+def prune_old(soul_path: Path, keep_days: int = 30):
+    """Remove absorbed entries older than keep_days from SOUL.md."""
+    if not soul_path.exists():
+        return
+    content = soul_path.read_text(encoding="utf-8")
+    cutoff = date.today() - timedelta(days=keep_days)
+    segments = re.split(r'(?=\n### \d{4}-\d{2}-\d{2}\n)', content)
+    kept = []
+    pruned = 0
+    for seg in segments:
+        m = re.match(r'\n### (\d{4}-\d{2}-\d{2})\n', seg)
+        if not m:
+            kept.append(seg)
+            continue
+        entry_date = date.fromisoformat(m.group(1))
+        if entry_date < cutoff and "<!-- absorbed: true -->" in seg:
+            pruned += 1
+            continue
+        kept.append(seg)
+    if pruned:
+        soul_path.write_text("".join(kept), encoding="utf-8")
+        print(f"Pruned {pruned} old absorbed entries from SOUL.md", file=sys.stderr)
+
+
+def extract_unabsorbed_lessons(lessons_path: Path) -> list[tuple[str, str]]:
+    """Parse LESSONS.md, return unabsorbed entries as (date_str, text) tuples.
+    Entries without any absorbed marker are treated as unabsorbed (backward compat)."""
+    if not lessons_path.exists():
+        return []
+    content = lessons_path.read_text(encoding="utf-8")
+    entries = re.split(r'(?=^## [\w-]+$)', content, flags=re.M)
+    result = []
+    for entry in entries:
+        entry = entry.strip()
+        if not entry.startswith("## "):
+            continue
+        if "<!-- absorbed: true -->" in entry or "<!-- rejected:" in entry or "<!-- needs-review -->" in entry:
+            continue
+        m = re.search(r'>\s*(\d{4}-\d{2}-\d{2})\s*\|', entry)
+        date_str = m.group(1) if m else "unknown"
+        result.append((date_str, entry))
+    return result
+
+
+def mark_absorbed_lessons(lessons_path: Path, slugs: list[str]):
+    """Mark lesson entries as absorbed in LESSONS.md.
+    Handles both new format (replace absorbed:false→true) and legacy (insert marker)."""
+    if not lessons_path.exists() or not slugs:
+        return
+    content = lessons_path.read_text(encoding="utf-8")
+    for slug in slugs:
+        escaped = re.escape(slug)
+        # Try replacing absorbed:false → true (new format)
+        new_content = re.sub(
+            rf'^(## {escaped}\n)<!-- absorbed: false -->',
+            rf'\1<!-- absorbed: true -->',
+            content, count=1, flags=re.M
+        )
+        if new_content != content:
+            content = new_content
+            continue
+        # Legacy: no marker at all → insert absorbed:true after ## slug line
+        new_content = re.sub(
+            rf'^(## {escaped}\n)(?!<!-- )',
+            rf'\1<!-- absorbed: true -->\n',
+            content, count=1, flags=re.M
+        )
+        content = new_content
+    lessons_path.write_text(content, encoding="utf-8")
+
+
+def prune_old_lessons(lessons_path: Path, keep_days: int = 90):
+    """Remove absorbed lesson entries older than keep_days."""
+    if not lessons_path.exists():
+        return
+    content = lessons_path.read_text(encoding="utf-8")
+    cutoff = date.today() - timedelta(days=keep_days)
+    entries = re.split(r'(?=^## [\w-]+$)', content, flags=re.M)
+    kept, pruned = [], 0
+    for entry in entries:
+        if not entry.strip().startswith("## "):
+            kept.append(entry)
+            continue
+        m = re.search(r'>\s*(\d{4}-\d{2}-\d{2})\s*\|', entry)
+        if m and "<!-- absorbed: true -->" in entry:
+            entry_date = date.fromisoformat(m.group(1))
+            if entry_date < cutoff:
+                pruned += 1
+                continue
+        kept.append(entry)
+    if pruned:
+        new_content = "".join(kept)
+        # Update entry count
+        entry_count = len(re.findall(r'^## [\w-]+$', new_content, re.M))
+        new_content = re.sub(r'Entries: \d+', f'Entries: {entry_count}', new_content)
+        lessons_path.write_text(new_content, encoding="utf-8")
+        print(f"Pruned {pruned} old absorbed entries from LESSONS.md", file=sys.stderr)
+
+
+def review_agent_entries(lessons_path: Path):
+    """Review <!-- needs-review --> entries written by agent: apply quality gate,
+    promote to absorbed:false or mark as rejected."""
+    if not lessons_path.exists():
+        return
+    content = lessons_path.read_text(encoding="utf-8")
+    if "<!-- needs-review -->" not in content:
+        return
+    entries = re.split(r'(?=^## [\w-]+$)', content, flags=re.M)
+    reviewed = 0
+    for i, entry in enumerate(entries):
+        if "<!-- needs-review -->" not in entry:
+            continue
+        # Extract slug for logging
+        slug_m = re.match(r'^## ([\w-]+)', entry.strip())
+        slug = slug_m.group(1) if slug_m else "unknown"
+        # Apply quality gate
+        dummy = [{"slug": slug, "text": entry}]
+        kept = lessons_quality_gate(dummy)
+        if kept:
+            entries[i] = entry.replace("<!-- needs-review -->", "<!-- absorbed: false -->")
+            print(f"Lessons review: {slug} → approved", file=sys.stderr)
+        else:
+            today_str = date.today().isoformat()
+            entries[i] = entry.replace("<!-- needs-review -->", f"<!-- rejected: {today_str} -->")
+            print(f"Lessons review: {slug} → rejected", file=sys.stderr)
+        reviewed += 1
+    if reviewed:
+        content = "".join(entries)
+        lessons_path.write_text(content, encoding="utf-8")
+        print(f"Reviewed {reviewed} agent-written entries in LESSONS.md", file=sys.stderr)
+
+
+def parse_distill_ops(raw: str) -> list[tuple[str, str, str]]:
+    """Parse LLM structured diff → [(op, section, content)]. Invalid lines skipped."""
+    ops = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line or line == "NOP":
+            continue
+        m = re.match(r'^(ADD|STRENGTHEN|WEAKEN|REMOVE)\s+(MUST|MUST_NOT|PREFER|CONTEXT):\s*(.+)$', line)
+        if m:
+            ops.append((m.group(1), m.group(2), m.group(3)))
+        elif line not in ("", "NOP"):
+            print(f"Distill: unparseable line: {line[:80]}", file=sys.stderr)
+    return ops
+
+
+DISTILL_MIN_ENTRIES = 7  # minimum unabsorbed entries before auto-triggering distill
+
+
+def _section_bounds(content: str, header: str) -> tuple[int, int] | None:
+    """Return (start, end) line indices for a section's bullet area (exclusive of header)."""
+    lines = content.splitlines()
+    start = None
+    for i, l in enumerate(lines):
+        if l.strip() == f"## {header}":
+            start = i + 1
+        elif start is not None and l.startswith("## "):
+            return (start, i)
+    if start is not None:
+        return (start, len(lines))
+    return None
+
+
+def apply_ops(content: str, ops: list[tuple[str, str, str]]) -> str:
+    """Apply structured diff operations to MEMORY.md content, scoped to target sections."""
+    if not content.strip():
+        content = MEMORY_SKELETON.format(date=date.today(), version=0)
+
+    for op, section, payload in ops:
+        header = "MUST NOT" if section == "MUST_NOT" else section
+        section_re = rf'(## {re.escape(header)}\n)(.*?)(?=\n## |\Z)'
+
+        if op == "ADD":
+            def add_rule(m, _payload=payload):
+                return m.group(1) + m.group(2).rstrip('\n') + f"\n- {_payload}\n"
+            content = re.sub(section_re, add_rule, content, count=1, flags=re.DOTALL)
+
+        elif op == "REMOVE":
+            bounds = _section_bounds(content, header)
+            if bounds:
+                lines = content.splitlines()
+                s, e = bounds
+                kept = [l for l in lines[s:e] if not (l.lstrip().startswith("- ") and payload in l)]
+                content = "\n".join(lines[:s] + kept + lines[e:]) + "\n"
+            else:
+                print(f"Distill: REMOVE section not found: {header}", file=sys.stderr)
+
+        elif op == "STRENGTHEN":
+            if "→" in payload:
+                old_hint, new_rule = payload.split("→", 1)
+                old_hint, new_rule = old_hint.strip(), new_rule.strip()
+                bounds = _section_bounds(content, header)
+                if bounds:
+                    lines = content.splitlines()
+                    s, e = bounds
+                    replaced = False
+                    for i in range(s, e):
+                        if old_hint in lines[i]:
+                            lines[i] = f"- {new_rule}"
+                            replaced = True
+                            break
+                    if replaced:
+                        content = "\n".join(lines) + "\n"
+                    else:
+                        print(f"Distill: STRENGTHEN target not found in {header}: {old_hint[:60]}", file=sys.stderr)
+
+        elif op == "WEAKEN":
+            bounds = _section_bounds(content, header)
+            removed_line = None
+            if bounds:
+                lines = content.splitlines()
+                s, e = bounds
+                for i in range(s, e):
+                    if lines[i].lstrip().startswith("- ") and payload in lines[i]:
+                        removed_line = lines[i].lstrip("- ").strip()
+                        lines.pop(i)
+                        content = "\n".join(lines) + "\n"
+                        break
+            if removed_line:
+                prefer_re = r'(## PREFER\n)(.*?)(?=\n## |\Z)'
+                def add_weakened(m, _rl=removed_line):
+                    return m.group(1) + m.group(2).rstrip('\n') + f"\n- {_rl} (待观察)\n"
+                content = re.sub(prefer_re, add_weakened, content, count=1, flags=re.DOTALL)
+
+    # Update metadata
+    content = re.sub(r'Updated: \S+', f'Updated: {date.today()}', content)
+    if (m := re.search(r'Version: (\d+)', content)):
+        content = re.sub(r'Version: \d+', f'Version: {int(m.group(1)) + 1}', content)
+
+    return content
+
+
+def cmd_distill(args):
+    """Distill SOUL.md observations + LESSONS.md lessons into MEMORY.md rules."""
+    soul_path = Path(args.soul)
+    memory_path = Path(args.memory)
+    lessons_path = Path(args.lessons)
+
+    # Phase 0: review agent-written entries (<!-- needs-review --> → quality gate)
+    review_agent_entries(lessons_path)
+
+    # Phase 1: extract unabsorbed from both sources
+    unabsorbed_soul = extract_unabsorbed(soul_path)
+    unabsorbed_lessons = extract_unabsorbed_lessons(lessons_path)
+    all_unabsorbed = unabsorbed_soul + unabsorbed_lessons
+
+    if not all_unabsorbed:
+        print("Distill: no unabsorbed entries in SOUL.md or LESSONS.md", file=sys.stderr); return
+    # Threshold applies to combined count (SOUL + LESSONS)
+    if len(all_unabsorbed) < DISTILL_MIN_ENTRIES and not args.force:
+        print(f"Distill: only {len(all_unabsorbed)} unabsorbed entries (need {DISTILL_MIN_ENTRIES}+). Use --force to override.", file=sys.stderr)
+        return
+
+    # Phase 1.5: mechanical pattern-key counting across ALL entries (absorbed + unabsorbed)
+    pattern_counts = extract_pattern_counts(soul_path, lessons_path)
+    pattern_section = ""
+    if pattern_counts:
+        # Include pk with count (days × occurrences) for richer signal
+        strong_pks = {k: v for k, v in pattern_counts.items() if v >= 2}
+        if strong_pks:
+            lines = [f"  {k}: {v}天" for k, v in strong_pks.items()]
+            pattern_section = (
+                "\n\n## Pattern-Key 出现天数（机械统计，地面真值）\n\n"
+                + "\n".join(lines)
+            )
+        print(f"Distill: {len(pattern_counts)} pattern-keys ({len(strong_pks)} with ≥2 days), top: "
+              + ", ".join(f"{k}={v}" for k, v in list(pattern_counts.items())[:5]),
+              file=sys.stderr)
+
+    # Phase 2: read current MEMORY.md
+    current_memory = memory_path.read_text(encoding="utf-8") if memory_path.exists() else ""
+
+    # Phase 3: LLM → structured diff (call_engine handles context limits)
+    obs_parts = []
+    if unabsorbed_soul:
+        obs_parts.append("### 行为观察（来自 SOUL.md）\n\n" +
+                         "\n\n".join(f"#### {d}\n{t}" for d, t in unabsorbed_soul))
+    if unabsorbed_lessons:
+        obs_parts.append("### 经验教训（来自 LESSONS.md）\n\n" +
+                         "\n\n".join(f"#### {d}\n{t}" for d, t in unabsorbed_lessons))
+    obs_text = "\n\n".join(obs_parts)
+    prompt = f"## Current MEMORY.md\n\n{current_memory}\n\n## New Input\n\n{obs_text}{pattern_section}"
+    print(f"Distill: {len(all_unabsorbed)} entries ({len(prompt)//1024}KB prompt)", file=sys.stderr)
+    raw_diff = call_engine(prompt, DISTILL_SYSTEM)
+
+    # Phase 4: parse and apply
+    ops = parse_distill_ops(raw_diff)
+    if not ops:
+        print("Distill: NOP, marking as absorbed", file=sys.stderr)
+    else:
+        new_memory = apply_ops(current_memory, ops)
+        memory_path.write_text(new_memory, encoding="utf-8")
+
+    # Phase 5: mark absorbed + prune old
+    mark_absorbed(soul_path, [d for d, _ in unabsorbed_soul])
+    prune_old(soul_path, keep_days=30)
+    _mark_lessons_absorbed(lessons_path, unabsorbed_lessons)
+    prune_old_lessons(lessons_path, keep_days=90)
+
+    total = len(unabsorbed_soul) + len(unabsorbed_lessons)
+    if ops:
+        print(f"OK {memory_path} ({len(ops)} ops, {total} entries absorbed: "
+              f"{len(unabsorbed_soul)} soul + {len(unabsorbed_lessons)} lessons)", file=sys.stderr)
+    else:
+        print(f"Distill: {total} entries marked absorbed (NOP)", file=sys.stderr)
+
+    # Phase 6: Gene promotion suggestions — pk≥3 days → candidate
+    if pattern_counts and lessons_path.exists():
+        lesson_pks = {}  # pk → area
+        content = lessons_path.read_text(encoding="utf-8")
+        for entry in re.split(r'(?=^## [\w-])', content, flags=re.M):
+            pk_m = re.search(r'pk:\s*([\w-]+)', entry)
+            area_m = re.search(r'area:\s*([\w-]+)', entry)
+            if pk_m:
+                lesson_pks[pk_m.group(1)] = area_m.group(1) if area_m else "unknown"
+        gene_candidates = [(pk, cnt, lesson_pks.get(pk, "unknown"))
+                          for pk, cnt in pattern_counts.items()
+                          if pk in lesson_pks and cnt >= 3]
+        if gene_candidates:
+            print(f"Gene promotion candidates ({len(gene_candidates)}):", file=sys.stderr)
+            for pk, cnt, area in gene_candidates:
+                print(f"  → {pk} ({cnt} days, area={area}) — run: scripts/extract-gene.sh {pk}",
+                      file=sys.stderr)
+
+
+def _mark_lessons_absorbed(lessons_path: Path, unabsorbed_lessons: list[tuple[str, str]]):
+    """Extract slugs from unabsorbed lessons and mark them absorbed."""
+    slugs = []
+    for _, text in unabsorbed_lessons:
+        m = re.match(r'^## ([\w-]+)', text.strip())
+        if m:
+            slugs.append(m.group(1))
+    mark_absorbed_lessons(lessons_path, slugs)
+
+
+def _parse_gene_yaml(filepath: Path) -> dict | None:
+    """Parse gene.yaml — flat top-level scalar fields only, no PyYAML.
+
+    Skips comment lines, indented lines (block scalar content), and
+    multiline block markers (value == '|'). Returns dict of scalar
+    fields or None if file is empty/invalid.
+    """
+    if not filepath.is_file():
+        return None
+    result = {}
+    for raw in filepath.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        # Skip comments and empty lines
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Indented line = block scalar content, skip
+        if raw[0:1].isspace():
+            continue
+        # Top-level key: value
+        if ":" in stripped:
+            key, _, value = stripped.partition(":")
+            value = value.strip().strip('"').strip("'")
+            if value == "|":
+                continue  # block scalar marker — skip, content lines are indented
+            result[key.strip()] = value
+    return result or None
+
+
+def cmd_gene_health(args):
+    """Compute Gene freshness scores and output health report."""
+    genes_dir = Path(args.genes_dir)
+    if not genes_dir.is_dir():
+        print(f"No genes directory at {genes_dir}", file=sys.stderr)
+        return
+
+    today = date.today()
+    genes = []
+    for entry in sorted(genes_dir.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        gene_yaml = entry / "gene.yaml"
+        gene = _parse_gene_yaml(gene_yaml)
+        if not gene:
+            continue
+        gene["_name"] = entry.name
+        gene["_path"] = str(gene_yaml)
+        genes.append(gene)
+
+    if not genes:
+        print("No genes found", file=sys.stderr)
+        return
+
+    active, stale, degraded = [], [], []
+    registry_entries = []
+    for g in genes:
+        last_used = g.get("last_used", "")
+        decay_window = int(g.get("decay_window_days") or 90)
+        if last_used:
+            try:
+                lu_date = date.fromisoformat(last_used[:10])
+                days_since = (today - lu_date).days
+            except ValueError:
+                days_since = decay_window
+        else:
+            # Never used — check created date
+            created = g.get("created", "")
+            if created:
+                try:
+                    cr_date = date.fromisoformat(created[:10])
+                    days_since = (today - cr_date).days
+                except ValueError:
+                    days_since = decay_window
+            else:
+                days_since = decay_window
+
+        freshness = max(0.0, round(1.0 - days_since / decay_window, 3))
+        status = "active" if freshness > 0.5 else "stale" if freshness > 0.2 else "degraded"
+        g["_freshness"] = freshness
+        g["_status"] = status
+
+        # Update gene.yaml in place
+        path = Path(g["_path"])
+        content = path.read_text(encoding="utf-8")
+        for field, val in [("freshness_score", freshness), ("decay_status", status)]:
+            if re.search(rf"^{field}:", content, flags=re.M):
+                content = re.sub(rf"^{field}:.*$", f"{field}: {val}", content, flags=re.M)
+            else:
+                content = content.rstrip("\n") + f"\n{field}: {val}\n"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+
+        {"active": active, "stale": stale, "degraded": degraded}[status].append(g)
+        registry_entries.append({
+            "gene_id": g.get("gene_id", ""),
+            "name": g["_name"],
+            "path": g["_name"],
+            "created": g.get("created", ""),
+            "decay_status": status,
+            "freshness_score": freshness,
+        })
+
+    # Rebuild registry.json from gene.yaml (SSOT: gene.yaml, registry is derived index)
+    registry_path = genes_dir / "registry.json"
+    tmp_registry = registry_path.with_suffix(".tmp")
+    tmp_registry.write_text(json.dumps({"genes": registry_entries}, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_registry, registry_path)
+
+    print(f"Gene Health: {len(active)} active, {len(stale)} stale, {len(degraded)} degraded", file=sys.stderr)
+    for g in stale:
+        print(f"  STALE: {g['_name']} (freshness={g['_freshness']}, last_used={g.get('last_used', 'never')})", file=sys.stderr)
+    for g in degraded:
+        print(f"  DEGRADED: {g['_name']} (freshness={g['_freshness']}, last_used={g.get('last_used', 'never')})", file=sys.stderr)
+
+
+def cmd_push(args):
+    """Push latest report to WeCom group webhook."""
+    webhook = os.environ.get("WECOM_WEBHOOK_URL")
+    if not webhook:
+        print("WECOM_WEBHOOK_URL not set, skip push", file=sys.stderr); return
+    reports_dir = Path(args.logs) / "reports"
+    # Find the most recently modified report file
+    reports = sorted(reports_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not reports:
+        print("No reports found", file=sys.stderr); return
+    report_text = reports[0].read_text(encoding="utf-8")
+    # WeCom markdown limit is 4096 bytes
+    if len(report_text.encode("utf-8")) > 4000:
+        report_text = report_text[:3500] + "\n\n...\n\n> 完整日报见服务器"
+    body = json.dumps({"msgtype": "markdown", "markdown": {"content": report_text}}).encode()
+    req = Request(webhook, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=10):
+            pass
+        print(f"Pushed {reports[0].name} to WeCom", file=sys.stderr)
+    except Exception as e:
+        print(f"Push failed: {e}", file=sys.stderr)
+
+
+def cmd_sync_memory(args):
+    """Commit and push ai-logs/ (which IS the ai-memory repo) to remote.
+
+    ai-logs/ is a git clone of the ai-memory repository. All cmd_* functions
+    write directly into it. This command simply stages, commits, and pushes.
+    No file copying — ai-logs/ is the SSOT.
+    """
+    logs_dir = Path(args.logs)
+    git_dir = logs_dir / ".git"
+    if not git_dir.is_dir():
+        print(f"sync-memory: {logs_dir} is not a git repo (no .git/)", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=str(logs_dir), check=True,
+                      capture_output=True, timeout=30)
+        # Idempotent: skip if nothing changed
+        result = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(logs_dir),
+                               capture_output=True, timeout=10)
+        if result.returncode == 0:
+            print("sync-memory: no changes to commit", file=sys.stderr); return
+        today_str = date.today().isoformat()
+        subprocess.run(["git", "commit", "-m", f"chore: sync {today_str}"],
+                      cwd=str(logs_dir), check=True, capture_output=True, timeout=30)
+        subprocess.run(["git", "push"], cwd=str(logs_dir), check=True,
+                      capture_output=True, timeout=120)
+        print(f"OK sync-memory: committed and pushed to ai-memory", file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
+        print(f"sync-memory git error: {err[:200]}", file=sys.stderr); sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("sync-memory: git operation timed out", file=sys.stderr); sys.exit(1)
+
+
+def main():
+    p = argparse.ArgumentParser(description="AI log report & soul builder")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    default_logs = os.environ.get("AI_LOGS_DIR", "./ai-logs")
+    r = sub.add_parser("report")
+    r.add_argument("--date", type=date.fromisoformat, default=None)
+    r.add_argument("--logs", default=default_logs)
+    s = sub.add_parser("soul")
+    s.add_argument("--date", type=date.fromisoformat, default=None)
+    s.add_argument("--since", type=date.fromisoformat, default=None)
+    s.add_argument("--logs", default=default_logs)
+    s.add_argument("--soul", default=str(Path(default_logs) / "SOUL.md"))
+    pu = sub.add_parser("push")
+    pu.add_argument("--logs", default=default_logs)
+    d = sub.add_parser("distill")
+    d.add_argument("--logs", default=default_logs)
+    d.add_argument("--soul", default=str(Path(default_logs) / "SOUL.md"))
+    d.add_argument("--memory", default=str(Path(default_logs) / "MEMORY.md"))
+    d.add_argument("--lessons", default=str(Path(default_logs) / "LESSONS.md"))
+    d.add_argument("--force", action="store_true", help="Distill even with <7 entries")
+    le = sub.add_parser("lessons")
+    le.add_argument("--date", type=date.fromisoformat, default=None)
+    le.add_argument("--logs", default=default_logs)
+    le.add_argument("--lessons", default=str(Path(default_logs) / "LESSONS.md"))
+    gh = sub.add_parser("gene-health")
+    gh.add_argument("--genes-dir", default=str(Path(default_logs) / ".genes"))
+    sm = sub.add_parser("sync-memory")
+    sm.add_argument("--logs", default=default_logs)
+    args = p.parse_args()
+    {"report": cmd_report, "soul": cmd_soul, "push": cmd_push,
+     "distill": cmd_distill, "lessons": cmd_lessons,
+     "gene-health": cmd_gene_health,
+     "sync-memory": cmd_sync_memory}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
