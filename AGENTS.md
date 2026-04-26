@@ -62,7 +62,8 @@ ai-log-converter/                    ai-logs/ (= ai-memory repo clone)
 ├── scripts/                        ├── claude/gemini/   (raw session data)
 │   └── extract-gene.sh             └── .git/ → (private remote)
 └── .agents/skills/
-    └── self-improving/SKILL.md
+    ├── self-improving/SKILL.md
+    └── search-docs/SKILL.md
 ```
 
 Three files split by change-axis: engine (low freq) / prompts (mid freq) / pipeline (high freq).
@@ -82,9 +83,9 @@ WECOM_WEBHOOK_URL=https://...    # optional, for push
 
 - `report [--date YYYY-MM-DD]` — daily work report with precise stats → `ai-logs/reports/{date}.md`
 - `push [--logs DIR]` — post latest report to WeCom group (silent if no webhook)
-- `soul [--date YYYY-MM-DD]` — full-context observation extraction to SOUL.md (quality-gated + LLM grounding)
-- `distill [--force]` — distill SOUL.md + LESSONS.md → MEMORY.md rules (structured diff, Gene promotion suggestions)
-- `lessons [--date YYYY-MM-DD]` — extract lessons learned → LESSONS.md (错题本: 坑/因/法 + area tags)
+- `soul [--date YYYY-MM-DD] [--since YYYY-MM-DD]` — full-context observation extraction to SOUL.md (quality-gated + LLM grounding)
+- `distill [--force] [--soul FILE] [--memory FILE] [--lessons FILE]` — distill SOUL.md + LESSONS.md → MEMORY.md rules (structured diff, Gene promotion suggestions)
+- `lessons [--date YYYY-MM-DD] [--lessons FILE]` — extract lessons learned → LESSONS.md (错题本: 坑/因/法 + area tags)
 - `gene-health [--genes-dir DIR]` — compute Gene freshness (decay model), rebuild registry.json, output health report
 - `sync-memory [--logs DIR]` — commit and push ai-logs/ to ai-memory remote
 

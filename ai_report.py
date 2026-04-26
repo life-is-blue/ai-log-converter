@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-ai_report.py — LLM-powered daily report + soul model builder.
+ai_report.py — LLM-powered daily report + soul model builder + distillation pipeline.
 
-Usage:
-  python3 ai_report.py report [--date YYYY-MM-DD] [--logs DIR]
-  python3 ai_report.py soul [--since YYYY-MM-DD] [--logs DIR] [--soul FILE]
-  python3 ai_report.py push [--logs DIR]
+Subcommands:
+  report       Daily work report with precise stats
+  push         Post latest report to WeCom group
+  soul         Full-context observation extraction → SOUL.md
+  lessons      Extract lessons learned → LESSONS.md
+  distill      Distill SOUL + LESSONS → MEMORY.md rules
+  gene-health  Compute Gene freshness, rebuild registry
+  sync-memory  Commit and push ai-logs/ to remote
 
-Env vars:
-  LLM_API_KEY           API key (required for report/soul)
+Config via .env (auto-loaded):
+  LLM_API_KEY           API key (required for report/soul/lessons/distill)
   LLM_BASE_URL          OpenAI-compatible endpoint (default: https://api.openai.com/v1)
   LLM_MODEL_NAME        Model name (default: gpt-4o-mini)
   LLM_MAX_TOKENS        Max tokens for LLM response (default: 2000)
@@ -24,7 +28,7 @@ from urllib.error import HTTPError
 from ai_engine import load_dotenv, call_engine, _codex_available
 from ai_prompts import (
     REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
-    LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON,
+    LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON, MEMORY_SKELETON,
 )
 
 

@@ -135,6 +135,15 @@ LESSONS_SYSTEM = (
 
 SOUL_SKELETON = "# SOUL.md — Observation Log\n\n> Last updated: {date}\n> Sessions: {count} files\n\n---\n"
 
+MEMORY_SKELETON = (
+    "# MEMORY.md — Behavioral Rules\n\n"
+    "> Updated: {date}\n"
+    "> Version: {version}\n\n"
+    "## MUST\n\n"
+    "## MUST NOT\n\n"
+    "## PREFER\n\n"
+    "## CONTEXT\n")
+
 LESSONS_SKELETON = (
     "# LESSONS.md — 经验教训\n\n"
     "> Last updated: {date}\n"

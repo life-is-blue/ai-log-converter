@@ -49,7 +49,7 @@ L2 = L1 + 立即在当前 session 里修复。
 ```markdown
 ## kebab-case-slug
 <!-- needs-review -->
-> YYYY-MM-DD | pk: kebab-case-pattern-key
+> YYYY-MM-DD | pk: kebab-case-pattern-key | area: AREA
 
 **坑**: 一句话描述问题现象
 **因**: 一句话描述根本原因
@@ -61,6 +61,7 @@ L2 = L1 + 立即在当前 session 里修复。
 - slug: 2-6 英文词，kebab-case，全局唯一可辨识
 - `<!-- needs-review -->` 标记**必须**紧跟 `## slug` 后一行（cron 会审查后替换为 absorbed 标记）
 - pk: 2-4 英文词，kebab-case，描述核心模式，同一模式跨条目复用
+- area 取值: backend | infra | config | toolchain | arch | docs
 - 坑/因/法全部用中文，每项一句话，不展开
 - 只记录**跨项目可迁移**的教训
 - 每次最多记录 2 条（宁缺毋滥）

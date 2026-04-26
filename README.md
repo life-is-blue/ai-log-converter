@@ -1,77 +1,92 @@
 # ai-log-converter
 
-> "别再让混乱的 AI 日志浪费你的生命。"
+> "每一次 AI 对话，都让下一次更聪明。"
 
-## 需求背景
+## 做什么
 
-当你使用 Claude Code, Gemini, CodeBuddy 或 Codex 时，它们产生的原始日志（JSON/JSONL）通常是一堆不可读的乱码。为了分析用户的提问习惯（心智模型），或者对比不同 AI 的回复质量，你需要一个高效、干净的手术刀，将这些数据切开并标准化。
+把 AI 工具的原始日志变成**可自我迭代的知识系统**。
 
-**ai-log-converter** 就是这把手术刀。但它不止于此——它还能从日志中蒸馏出行为规则、经验教训、方法论 Gene，让每次 AI 对话都让下一次更聪明。
-
-## 核心架构
+不只是格式转换——是一个闭环：日志 → 观察 → 规则 → 方法论 → 回流到下次 AI 对话。你用得越多，AI 就越懂你。
 
 ```mermaid
 graph LR
-    A[原始 AI 日志] --> B{格式识别}
-    B -- Claude --> C[Claude Mapper]
-    B -- Gemini --> D[Gemini Mapper]
-    B -- CodeBuddy --> E[CodeBuddy Mapper]
-    B -- Codex --> F[Codex Mapper]
-    C & D & E & F --> G[流式处理核心]
-    G --> H[Markdown - 人类阅读]
-    G --> I[JSONL - 训练模型]
-    G --> J[Plain Text - 语料分析]
-    G --> K[蒸馏管线]
-    K --> L[SOUL.md - 行为观察]
-    K --> M[LESSONS.md - 经验教训]
-    L & M --> N[MEMORY.md - 行为规则]
-    L & M --> O[.genes/ - 方法论 Gene]
+    A[AI 会话日志] --> B[格式转换]
+    B --> C[蒸馏管线]
+    C --> D[SOUL.md<br/>行为观察]
+    C --> E[LESSONS.md<br/>经验教训]
+    D & E --> F[MEMORY.md<br/>行为规则]
+    D & E --> G[.genes/<br/>方法论 Gene]
+    F & G -->|git-library MCP| H[下一次 AI 对话]
+    H -->|产生新日志| A
 ```
 
-## 支持的格式
+关键在最后那条回路。MEMORY.md 和 Gene 通过 git-library MCP 分发到所有项目的 AI Agent，Agent 在对话中读取并遵循你的规则，产生新的日志，再被蒸馏。**闭环自转。**
 
-- **Claude Code**: 深度支持子智能体（Subagent）识别及 XML 标签剥离。
-- **Gemini**: 支持 `parts` 数组解析、工具调用及 `thoughts` 提取（自动计算 Slop 分数）。
-- **CodeBuddy**: 清理内部输入/输出文本块及函数调用标记。
-- **OpenAI Codex**: 针对 `response_item` 负载结构的精准提取。
+## 蒸馏管线
 
-## 核心特性
+每天 cron 自动执行完整链路：
 
-- **懂人心**：自动识别并跳过那些没用的元数据（Metadata），直奔对话主题。
-- **Slop 指标**：内置"废话率"算法。通过 `Slop Score` (推理长度 / 整体长度)，帮你一眼识破那些在"胡思乱想"的 AI。
-- **全量蒸馏**：200K 字符全量上下文提取行为观察，quality gate + grounding check 双重质量门控。
-- **自我进化**：观察 → 规则 → 方法论 Gene，可衰减追踪，高频模式自动晋升建议。
-- **无依赖**：纯 stdlib，无任何 `pip install` 负担。
-- **超快**：JSONL 输入采用流式处理，即便处理 10GB 级别日志，内存占用也微乎其微。
-- **零噪音**：默认成功时静默输出，仅在异常时写入 `stderr`。
+```
+harvest → report → push → soul → lessons → distill → gene-health → sync-memory
+   │         │       │      │        │         │          │            │
+   │         │       │      │        │         │          │            └─ 推送到知识仓库
+   │         │       │      │        │         │          └─ Gene 衰减追踪
+   │         │       │      │        │         └─ 蒸馏规则 → MEMORY.md
+   │         │       │      │        └─ 提取教训 → LESSONS.md
+   │         │       │      └─ 提取观察 → SOUL.md
+   │         │       └─ 推送到企微群
+   │         └─ 生成日报
+   └─ 采集日志
+```
 
-## 快速开始
+| 子命令 | 做什么 |
+|--------|--------|
+| `report` | 日报：精确工具统计 + LLM 摘要 |
+| `push` | 推送日报到企业微信群 |
+| `soul` | 全量上下文（200K）行为观察提取，quality gate + grounding check 双重门控 |
+| `lessons` | 经验教训提取：坑/因/法，只留跨项目可迁移的错题本 |
+| `distill` | 蒸馏 SOUL + LESSONS → MEMORY.md 行为规则（MUST/MUST_NOT/PREFER/CONTEXT） |
+| `gene-health` | Gene 新鲜度衰减模型，registry 重建，晋升建议 |
+| `sync-memory` | 提交并推送到远端知识仓库，供 git-library MCP 检索分发 |
+
+## 自我迭代是怎么发生的
+
+```
+Day 1: soul 提取到 "用户坚持 plan-before-act"（观察）
+Day 3: 同一 pattern-key 出现 3 天 → distill 生成 MUST 规则
+Day 5: lessons 提取到 "不 plan 就动手导致返工"（教训）
+Day 7: pattern-key ≥3 天 → distill 建议晋升为 Gene
+       → 人工执行 extract-gene.sh → 方法论固化为可版本化的 Gene
+Day 8: 新项目的 AI Agent 通过 git-library 读到这条 Gene → 主动遵循
+       → 产生新日志 → 回到 Day 1
+```
+
+- **弱信号**（1 天出现）→ 观察记录，不生成规则
+- **中等信号**（2 天）→ 加入 PREFER
+- **强信号**（≥3 天）→ 晋升 MUST，建议提取 Gene
+- **Gene 衰减**：90 天不使用 → freshness 归零，标记 degraded
+
+规则不是只增不减。长期未被观察引证的规则会被 WEAKEN/REMOVE——进化，不是堆积。
+
+## 转换器
+
+同时也是一把高效的日志格式转换工具：
+
+- **Claude Code**: 深度支持子智能体识别及 XML 标签剥离
+- **Gemini**: `parts` 数组解析、工具调用、`thoughts` 提取
+- **CodeBuddy**: 内部文本块清理及函数调用标记
+- **OpenAI Codex**: `response_item` 负载结构精准提取
 
 ```bash
-# 转换单个会话
+# 基础转换
 python3 ai_log_converter.py input.jsonl output.md
 
-# 全量采集 + 日报 + 推送 + 蒸馏（日常 cron 做的事）
-make harvest && make report && make push && make soul && make lessons && make distill && make gene-health && make sync-memory
-
-# 安装 cron（每天 08:47 自动执行上述全链路）
-make install-cron
-```
-
-### 更多姿势
-
-```bash
-# 提取用户心智模型（纯文本分析）
+# 提取用户心智模型
 python3 ai_log_converter.py -t txt --role user input.jsonl user_mind.txt
 
-# 准备自动化训练集（标准化 JSONL）
-python3 ai_log_converter.py -t jsonl --role assistant input.jsonl train_data.jsonl
-
-# 创建一个方法论 Gene
-scripts/extract-gene.sh plan-before-act
+# Slop Score — 一眼识破在"胡思乱想"的 AI
+python3 ai_log_converter.py --slop input.jsonl output.md
 ```
-
-## 转换器参数
 
 ```
 -f FORMAT          强制格式: claude | gemini | codebuddy | codex (默认: 自动检测)
@@ -81,21 +96,20 @@ scripts/extract-gene.sh plan-before-act
 --slop             显示 Slop Score（推理占比）
 ```
 
-## 蒸馏管线
+## 快速开始
 
-七个子命令，串联成完整的知识蒸馏链路：
+```bash
+# 全量采集 + 蒸馏全链路（日常 cron 做的事）
+make harvest && make report && make push && make soul && make lessons && make distill && make gene-health && make sync-memory
 
-| 子命令 | 做什么 |
-|--------|--------|
-| `report` | 日报：精确工具统计 + LLM 摘要 |
-| `push` | 推送日报到企业微信群 |
-| `soul` | 全量上下文行为观察提取（quality-gated + grounded） |
-| `lessons` | 经验教训提取：坑/因/法（跨项目可迁移的错题本） |
-| `distill` | 蒸馏 SOUL + LESSONS → MEMORY.md 行为规则 |
-| `gene-health` | Gene 新鲜度衰减、registry 重建、健康报告 |
-| `sync-memory` | 提交并推送到远端知识仓库 |
+# 安装 cron（每天 08:47 自动执行）
+make install-cron
 
-## 文件结构
+# 创建一个方法论 Gene
+scripts/extract-gene.sh plan-before-act
+```
+
+## 架构
 
 ```
 ai_report.py          流水线：7 个子命令，数据流转逻辑
@@ -115,6 +129,8 @@ LLM_BASE_URL=http://...          # optional
 LLM_MODEL_NAME=glm-5             # optional
 WECOM_WEBHOOK_URL=https://...    # optional, for push
 ```
+
+无依赖，纯 stdlib。流式处理，10GB 级别日志内存无压力。成功时零输出。
 
 ---
 *Talk is cheap. Show me the code.*
