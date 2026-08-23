@@ -42,6 +42,9 @@ from ai_report import (
     _check_rule_freshness,
     _soul_touched_on_day,
     _report_month_dir,
+    _truncate_utf8,
+    WECOM_MAX_BYTES,
+    WECOM_TRUNCATE_FOOTER,
 )
 from ai_prompts import MEMORY_SKELETON
 
@@ -651,6 +654,33 @@ class TestSkipBuffer(unittest.TestCase):
             self.assertIn('gene', sources)
             # After clear
             self.assertEqual(read_and_clear_skip_buffer(logs), [])
+
+
+class TestTruncateUtf8(unittest.TestCase):
+    """Regression: WeCom push truncated by char-slicing a byte-length check,
+    which could leave the result over WeCom's real byte limit for CJK text."""
+
+    def test_short_text_unchanged(self):
+        self.assertEqual(_truncate_utf8("hello", 100), "hello")
+
+    def test_cuts_on_char_boundary_not_byte_boundary(self):
+        # Each CJK char is 3 UTF-8 bytes; cutting at 7 bytes must not split one.
+        text = "你好世界"
+        result = _truncate_utf8(text, 7)
+        result.encode("utf-8")  # raises if a char was split
+        self.assertLessEqual(len(result.encode("utf-8")), 7)
+        self.assertEqual(result, "你好")
+
+    def test_real_report_stays_under_wecom_limit_after_footer(self):
+        """The exact scenario that broke production: byte length was checked,
+        but the old code truncated by character count, so a CJK-heavy report
+        just above the trigger threshold got the footer appended on top of
+        the (unshortened) full text, pushing it past WeCom's real limit."""
+        cjk_paragraph = "工作日报内容测试" * 300  # ~1200 chars, ~3600 bytes: over old 4000-byte trigger, under old 3500-char cut
+        self.assertGreater(len(cjk_paragraph.encode("utf-8")), WECOM_MAX_BYTES)
+        footer_bytes = len(WECOM_TRUNCATE_FOOTER.encode("utf-8"))
+        result = _truncate_utf8(cjk_paragraph, WECOM_MAX_BYTES - footer_bytes) + WECOM_TRUNCATE_FOOTER
+        self.assertLessEqual(len(result.encode("utf-8")), WECOM_MAX_BYTES)
 
 
 class TestReportMonthDir(unittest.TestCase):

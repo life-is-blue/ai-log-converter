@@ -1883,6 +1883,18 @@ def cmd_gene_health(args):
         print(f"  DEGRADED: {g['_name']} (freshness={g['_freshness']}, last_used={g.get('last_used', 'never')})", file=sys.stderr)
 
 
+WECOM_MAX_BYTES = 4096
+WECOM_TRUNCATE_FOOTER = "\n\n...\n\n> 完整日报见服务器"
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Truncate text to at most max_bytes UTF-8 bytes, on a valid char boundary."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def cmd_push(args):
     """Push latest report to WeCom group webhook."""
     webhook = os.environ.get("WECOM_WEBHOOK_URL")
@@ -1898,15 +1910,18 @@ def cmd_push(args):
     if not reports:
         print("No reports found", file=sys.stderr); return
     report_text = reports[0].read_text(encoding="utf-8")
-    # WeCom markdown limit is 4096 bytes
-    if len(report_text.encode("utf-8")) > 4000:
-        report_text = report_text[:3500] + "\n\n...\n\n> 完整日报见服务器"
+    if len(report_text.encode("utf-8")) > WECOM_MAX_BYTES:
+        footer_bytes = len(WECOM_TRUNCATE_FOOTER.encode("utf-8"))
+        report_text = _truncate_utf8(report_text, WECOM_MAX_BYTES - footer_bytes) + WECOM_TRUNCATE_FOOTER
     body = json.dumps({"msgtype": "markdown", "markdown": {"content": report_text}}).encode()
     req = Request(webhook, data=body, headers={"Content-Type": "application/json"})
     try:
-        with urlopen(req, timeout=10):
-            pass
-        print(f"Pushed {reports[0].name} to WeCom", file=sys.stderr)
+        with urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if result.get("errcode", 0) != 0:
+            print(f"Push failed: WeCom rejected ({result.get('errcode')}: {result.get('errmsg')})", file=sys.stderr)
+        else:
+            print(f"Pushed {reports[0].name} to WeCom", file=sys.stderr)
     except Exception as e:
         print(f"Push failed: {e}", file=sys.stderr)
 
