@@ -6,6 +6,7 @@ Tests call production code directly — no logic duplication.
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from datetime import date
@@ -43,8 +44,8 @@ from ai_report import (
     _soul_touched_on_day,
     _report_month_dir,
     _truncate_utf8,
+    _repo_web_url,
     WECOM_MAX_BYTES,
-    WECOM_TRUNCATE_FOOTER,
 )
 from ai_prompts import MEMORY_SKELETON
 
@@ -678,9 +679,33 @@ class TestTruncateUtf8(unittest.TestCase):
         the (unshortened) full text, pushing it past WeCom's real limit."""
         cjk_paragraph = "工作日报内容测试" * 300  # ~1200 chars, ~3600 bytes: over old 4000-byte trigger, under old 3500-char cut
         self.assertGreater(len(cjk_paragraph.encode("utf-8")), WECOM_MAX_BYTES)
-        footer_bytes = len(WECOM_TRUNCATE_FOOTER.encode("utf-8"))
-        result = _truncate_utf8(cjk_paragraph, WECOM_MAX_BYTES - footer_bytes) + WECOM_TRUNCATE_FOOTER
+        footer = "\n\n...\n\n> 完整日报: https://cnb.cool/ai-alchemy-factory/ai-memory/-/blob/main/reports/2026/08/2026-08-22.md"
+        footer_bytes = len(footer.encode("utf-8"))
+        result = _truncate_utf8(cjk_paragraph, WECOM_MAX_BYTES - footer_bytes) + footer
         self.assertLessEqual(len(result.encode("utf-8")), WECOM_MAX_BYTES)
+
+
+class TestRepoWebUrl(unittest.TestCase):
+    """Tests for _repo_web_url (derives the report's web link from git remote)."""
+
+    def test_derives_url_from_https_remote(self):
+        with tempfile.TemporaryDirectory() as d:
+            logs = Path(d)
+            subprocess.run(["git", "init", "-q", str(logs)], check=True)
+            subprocess.run(
+                ["git", "-C", str(logs), "remote", "add", "origin",
+                 "https://cnb.cool/ai-alchemy-factory/ai-memory.git"],
+                check=True,
+            )
+            url = _repo_web_url(logs, "reports/2026/08/2026-08-22.md")
+            self.assertEqual(
+                url,
+                "https://cnb.cool/ai-alchemy-factory/ai-memory/-/blob/main/reports/2026/08/2026-08-22.md",
+            )
+
+    def test_no_git_repo_returns_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(_repo_web_url(Path(d), "reports/x.md"))
 
 
 class TestReportMonthDir(unittest.TestCase):

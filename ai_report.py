@@ -1884,7 +1884,6 @@ def cmd_gene_health(args):
 
 
 WECOM_MAX_BYTES = 4096
-WECOM_TRUNCATE_FOOTER = "\n\n...\n\n> 完整日报见服务器"
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> str:
@@ -1895,12 +1894,30 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def _repo_web_url(logs_dir: Path, rel_path: str) -> str | None:
+    """Web URL for a file in the ai-memory repo, derived from its git remote
+    (not hardcoded — the org/repo has already moved once)."""
+    try:
+        remote = subprocess.run(
+            ["git", "-C", str(logs_dir), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    m = re.match(r"https://([^/]+)/(.+?)(?:\.git)?$", remote)
+    if not m:
+        return None
+    host, slug = m.groups()
+    return f"https://{host}/{slug}/-/blob/main/{rel_path}"
+
+
 def cmd_push(args):
     """Push latest report to WeCom group webhook."""
     webhook = os.environ.get("WECOM_WEBHOOK_URL")
     if not webhook:
         print("WECOM_WEBHOOK_URL not set, skip push", file=sys.stderr); return
-    reports_dir = Path(args.logs) / "reports"
+    logs_dir = Path(args.logs)
+    reports_dir = logs_dir / "reports"
     # Find the most recently modified work report (YYYY-MM-DD.md only, exclude daily-health-*)
     # reports/ is partitioned reports/YYYY/MM/, so recurse rather than glob one level.
     reports = sorted(
@@ -1911,8 +1928,10 @@ def cmd_push(args):
         print("No reports found", file=sys.stderr); return
     report_text = reports[0].read_text(encoding="utf-8")
     if len(report_text.encode("utf-8")) > WECOM_MAX_BYTES:
-        footer_bytes = len(WECOM_TRUNCATE_FOOTER.encode("utf-8"))
-        report_text = _truncate_utf8(report_text, WECOM_MAX_BYTES - footer_bytes) + WECOM_TRUNCATE_FOOTER
+        web_url = _repo_web_url(logs_dir, reports[0].relative_to(logs_dir).as_posix())
+        footer = f"\n\n...\n\n> 完整日报: {web_url}" if web_url else "\n\n...\n\n> 完整日报见服务器"
+        footer_bytes = len(footer.encode("utf-8"))
+        report_text = _truncate_utf8(report_text, WECOM_MAX_BYTES - footer_bytes) + footer
     body = json.dumps({"msgtype": "markdown", "markdown": {"content": report_text}}).encode()
     req = Request(webhook, data=body, headers={"Content-Type": "application/json"})
     try:
