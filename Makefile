@@ -1,4 +1,4 @@
-.PHONY: test clean harvest pull-memory collector leader report push soul dream distill lessons gene-health daily interventions sync-memory install-cron uninstall-cron backfill-soul setup
+.PHONY: test clean harvest migrate-flat-sessions pull-memory collector leader report push soul dream distill lessons gene-health daily interventions sync-memory install-cron uninstall-cron backfill-soul setup
 
 LOGS     := $(CURDIR)/ai-memory
 CONVERTER := python3 ai_log_converter.py
@@ -62,10 +62,11 @@ harvest:
 		$(CONVERTER) -f codebuddy -t jsonl "$$src" "$$tgt.jsonl" && \
 		echo "OK $$tgt" >&2; \
 	done
-	@# --- Codex ---
+	@# --- Codex (project dir from session_meta cwd; 'default' when absent) ---
 	@find $(HOME)/.codex/sessions -name '*.jsonl' 2>/dev/null | while read src; do \
 		session=$$(basename "$$src" .jsonl); \
-		tgt=$(LOGS)/codex/default/$$session; \
+		project=$$($(CONVERTER) -f codex --project "$$src"); \
+		tgt=$(LOGS)/codex/$$project/$$session; \
 		[ -f "$$tgt.jsonl" ] && [ "$$tgt.jsonl" -nt "$$src" ] && continue; \
 		mkdir -p $$(dirname "$$tgt"); \
 		$(CONVERTER) -f codex "$$src" "$$tgt.md" && \
@@ -84,7 +85,8 @@ harvest:
 		$(CONVERTER) -f cursor -t jsonl "$$src" "$$tgt.jsonl" && \
 		echo "OK $$tgt" >&2; \
 	done
-	@# --- Agy / Antigravity CLI (prefer current path over legacy path for duplicate IDs) ---
+	@# --- Agy / Antigravity CLI (prefer current path over legacy path for duplicate IDs;
+	@# project dir from run_command Cwd; 'default' when no absolute Cwd) ---
 	@for base in $(HOME)/.gemini/antigravity-cli/brain $(HOME)/.gemini/antigravity/brain; do \
 		find "$$base" -path '*/.system_generated/logs/transcript.jsonl' -type f 2>/dev/null | while read src; do \
 			session=$$(basename "$$(dirname "$$(dirname "$$(dirname "$$src")")")"); \
@@ -92,12 +94,52 @@ harvest:
 			   [ -f "$(HOME)/.gemini/antigravity-cli/brain/$$session/.system_generated/logs/transcript.jsonl" ]; then \
 				continue; \
 			fi; \
-			tgt=$(LOGS)/agy/default/$$session; \
+			project=$$($(CONVERTER) -f agy --project "$$src"); \
+			tgt=$(LOGS)/agy/$$project/$$session; \
 			[ -f "$$tgt.jsonl" ] && [ "$$tgt.jsonl" -nt "$$src" ] && continue; \
 			mkdir -p "$$(dirname "$$tgt")"; \
 			$(CONVERTER) -f agy "$$src" "$$tgt.md" && \
 			$(CONVERTER) -f agy -t jsonl "$$src" "$$tgt.jsonl" && \
 			echo "OK $$tgt" >&2; \
+		done; \
+	done
+	@# --- One-time: move flat codex/agy default/ sessions into project dirs.
+	@# Only sessions with a local source file can be probed; the rest stay in
+	@# default/ until their origin machine runs this target too. Commit via sync-memory.
+	@# Sessions already re-harvested into their project dir are identical copies —
+	@# drop the stale default/ one instead of failing the git mv. ---
+migrate-flat-sessions:
+	@test -d '$(LOGS)/.git' || { echo "ERROR: $(LOGS) is not a git repository" >&2; exit 1; }
+	@find $(HOME)/.codex/sessions -name '*.jsonl' 2>/dev/null | while read src; do \
+		session=$$(basename "$$src" .jsonl); \
+		project=$$($(CONVERTER) -f codex --project "$$src"); \
+		[ "$$project" = "default" ] && continue; \
+		for ext in .jsonl .md; do \
+			old=$(LOGS)/codex/default/$$session$$ext; \
+			[ -f "$$old" ] || continue; \
+			if [ -f "$(LOGS)/codex/$$project/$$session$$ext" ]; then \
+				git -C '$(LOGS)' rm -q "$$old" && echo "DROPPED duplicate codex/$$session -> $$project" >&2; \
+			else \
+				mkdir -p $(LOGS)/codex/$$project; \
+				git -C '$(LOGS)' mv "$$old" "codex/$$project/$$session$$ext" && echo "MIGRATED codex/$$session -> $$project" >&2; \
+			fi; \
+		done; \
+	done
+	@for base in $(HOME)/.gemini/antigravity-cli/brain $(HOME)/.gemini/antigravity/brain; do \
+		find "$$base" -path '*/.system_generated/logs/transcript.jsonl' -type f 2>/dev/null | while read src; do \
+			session=$$(basename "$$(dirname "$$(dirname "$$(dirname "$$src")")")"); \
+			project=$$($(CONVERTER) -f agy --project "$$src"); \
+			[ "$$project" = "default" ] && continue; \
+			for ext in .jsonl .md; do \
+				old=$(LOGS)/agy/default/$$session$$ext; \
+				[ -f "$$old" ] || continue; \
+				if [ -f "$(LOGS)/agy/$$project/$$session$$ext" ]; then \
+					git -C '$(LOGS)' rm -q "$$old" && echo "DROPPED duplicate agy/$$session -> $$project" >&2; \
+				else \
+					mkdir -p $(LOGS)/agy/$$project; \
+					git -C '$(LOGS)' mv "$$old" "agy/$$project/$$session$$ext" && echo "MIGRATED agy/$$session -> $$project" >&2; \
+				fi; \
+			done; \
 		done; \
 	done
 report:

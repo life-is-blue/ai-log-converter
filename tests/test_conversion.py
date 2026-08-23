@@ -117,5 +117,61 @@ class TestAiLogConverter(unittest.TestCase):
 
         self.assertEqual(result.stderr, "")
 
+    def test_project_probe_codex_reads_session_meta_cwd(self):
+        input_file = self.DATA_DIR / "codex_masked.jsonl"
+        for extra in ([], ["-f", "codex"]):
+            with self.subTest(args=extra):
+                result = subprocess.run(
+                    ["python3", str(self.SCRIPT), "--project", *extra, str(input_file)],
+                    capture_output=True, text=True, check=True,
+                )
+                self.assertEqual(result.stdout.strip(), "git-library")
+
+    def test_project_probe_agy_from_run_command_cwd(self):
+        # The fixture's only tool call carries {"directory": "."} — no Cwd hint.
+        input_file = self.DATA_DIR / "agy_masked.jsonl"
+        result = subprocess.run(
+            ["python3", str(self.SCRIPT), "-f", "agy", "--project", str(input_file)],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "default")
+
+        # A PLANNER_RESPONSE with an absolute run_command Cwd identifies the project.
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl", delete=False) as tf:
+            tf.write(json.dumps({
+                "type": "PLANNER_RESPONSE", "source": "MODEL", "status": "DONE",
+                "step_index": 1, "created_at": "2026-08-22T07:20:02Z",
+                "tool_calls": [{"name": "run_command",
+                                "args": {"Cwd": "\"/data/home/x/project/git-library\""}}],
+            }) + "\n")
+            temp_path = tf.name
+        try:
+            result = subprocess.run(
+                ["python3", str(self.SCRIPT), "-f", "agy", "--project", temp_path],
+                capture_output=True, text=True, check=True,
+            )
+            self.assertEqual(result.stdout.strip(), "git-library")
+        finally:
+            Path(temp_path).unlink(missing_ok=True)
+
+    def test_project_probe_promotes_dot_leading_basename(self):
+        # Workspace-internal dirs like git-library/.data file with the project root.
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl", delete=False) as tf:
+            tf.write(json.dumps({
+                "type": "PLANNER_RESPONSE", "source": "MODEL", "status": "DONE",
+                "step_index": 1, "created_at": "2026-08-22T07:20:02Z",
+                "tool_calls": [{"name": "run_command",
+                                "args": {"Cwd": "/data/home/x/project/git-library/.data"}}],
+            }) + "\n")
+            temp_path = tf.name
+        try:
+            result = subprocess.run(
+                ["python3", str(self.SCRIPT), "-f", "agy", "--project", temp_path],
+                capture_output=True, text=True, check=True,
+            )
+            self.assertEqual(result.stdout.strip(), "git-library")
+        finally:
+            Path(temp_path).unlink(missing_ok=True)
+
 if __name__ == "__main__":
     unittest.main()

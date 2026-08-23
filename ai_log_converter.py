@@ -236,6 +236,59 @@ def map_agy(entry: dict) -> Generator[dict, None, None]:
             }
 
 
+def _project_dir(cwd: str) -> str:
+    """Sanitize a cwd string into a safe directory name; 'default' when unusable.
+
+    Dot-leading basenames (e.g. git-library/.data) are workspace-internal dirs —
+    promote to the parent component so the session files with its project root.
+    """
+    parts = [p for p in (cwd or "").strip().strip('"').split("/") if p]
+    while parts and parts[-1].startswith("."):
+        parts.pop()
+    return parts[-1] if parts else "default"
+
+
+def probe_project(path: str, fmt: str, max_lines: int = 200) -> str:
+    """Stream-read a source log's head to infer the project directory name.
+
+    Single source of truth for project partitioning, shared by the Makefile
+    harvest loops and the one-time migration. Returns 'default' when the
+    format carries no usable project hint.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+
+                if fmt == "codex":
+                    # First line is session_meta; payload.cwd is authoritative.
+                    if entry.get("type") == "session_meta":
+                        return _project_dir((entry.get("payload") or {}).get("cwd", ""))
+
+                elif fmt == "agy":
+                    # run_command Cwd carries the agent's own working directory;
+                    # only absolute paths are trustworthy.
+                    for call in entry.get("tool_calls") or []:
+                        if not isinstance(call, dict) or call.get("name") != "run_command":
+                            continue
+                        cwd = (call.get("args") or {}).get("Cwd", "")
+                        if isinstance(cwd, str) and cwd.strip().strip('"').startswith("/"):
+                            return _project_dir(cwd)
+    except OSError:
+        pass
+    return "default"
+
+
 MAPPER_REGISTRY = {
     "claude": map_claude,
     "gemini": map_gemini,
@@ -291,6 +344,8 @@ def main():
     parser.add_argument("input", nargs="?", default="-")
     parser.add_argument("output", nargs="?", default="-")
     parser.add_argument("-f", "--format", choices=list(MAPPER_REGISTRY.keys()))
+    parser.add_argument("--project", action="store_true",
+                        help="Print the inferred project directory name (from codex session_meta cwd / agy run_command Cwd) and exit")
     parser.add_argument("-t", "--type", choices=["md", "txt", "jsonl"], default="md")
     parser.add_argument("-r", "--role", choices=["user", "assistant", "all"], default="all")
     parser.add_argument("--no-thoughts", action="store_true")
@@ -298,6 +353,29 @@ def main():
     args = parser.parse_args()
 
     inf = sys.stdin if args.input == "-" else open(args.input, "r", encoding="utf-8")
+
+    if args.project:
+        fmt = args.format
+        if not fmt and args.input != "-":
+            # Peek to detect format, reusing the main detection path below is
+            # overkill: codex/agy are identifiable from their first entries.
+            with open(args.input, encoding="utf-8") as f:
+                samples = []
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        samples.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+                    if len(samples) >= DETECT_PEEK_LIMIT:
+                        break
+            fmt = detect_format(samples)
+        print(probe_project(args.input, fmt or ""))
+        if inf is not sys.stdin: inf.close()
+        return
+
     outf = sys.stdout if args.output == "-" else open(args.output, "w", encoding="utf-8")
     
     try:

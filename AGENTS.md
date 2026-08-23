@@ -32,13 +32,15 @@ scripts/extract-gene.sh plan-before-act
 --role ROLE        Filter: user | assistant | all (default: all)
 --no-thoughts      Strip reasoning/thinking blocks
 --slop             Show Slop Score per message
+--project          Print the inferred project dir and exit (codex: session_meta cwd; agy: run_command Cwd; 'default' when no hint)
 ```
 
 ## Makefile Targets
 
 | Target | What it does |
 |--------|-------------|
-| `make harvest` | Convert sessions from ~/.gemini (Gemini/Agy), ~/.claude-internal, ~/.tclaude, ~/.codebuddy, ~/.codex, ~/.cursor → ai-memory/ |
+| `make harvest` | Convert sessions from ~/.gemini (Gemini/Agy), ~/.claude-internal, ~/.tclaude, ~/.codebuddy, ~/.codex, ~/.cursor → ai-memory/. All tools land in `ai-memory/<tool>/<project>/<session>`; codex project from session_meta cwd, agy from run_command Cwd, `default` when no hint |
+| `make migrate-flat-sessions` | One-time: git mv legacy flat `codex/default/`, `agy/default/` sessions into project dirs (probed from local sources; commit via sync-memory). Run once per machine after upgrading, then `make sync-memory` |
 | `make pull-memory` | Rebase-pull ai-memory; refuses if it has tracked local changes (sync first) |
 | `make collector` | Collector role: pull-memory → harvest → sync-memory. Raw logs only, no LLM |
 | `make leader` | Leader role: collector steps + full distillation chain. Exactly one machine runs this |
@@ -88,6 +90,20 @@ Raw logs are written by many, derived knowledge by exactly one:
 
 Running two leaders would make them fight over the same derived files (SOUL/MEMORY/LESSONS/AGENTS).
 `sync-memory` retries a rebase when the remote advanced, which covers concurrent collectors.
+
+### Upgrading to per-project codex/agy storage (one-time, per machine)
+
+Legacy harvest flattened codex/agy sessions into `codex/default/` and `agy/default/`.
+Each machine that has ever harvested must run, once, after pulling this repo:
+
+```bash
+make pull-memory          # receive the other machines' renames first
+make migrate-flat-sessions  # git mv local-source sessions into project dirs
+make sync-memory          # push the renames
+```
+
+Sessions whose source files only exist on another machine stay in `default/` until
+that machine runs the same sequence; the repos converge via git renames.
 
 ## ai_report.py
 
