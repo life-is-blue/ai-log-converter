@@ -28,7 +28,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
-from ai_engine import load_dotenv, call_engine, _codex_available
+from ai_engine import load_dotenv, call_engine, _codex_enabled
 from ai_prompts import (
     REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
     LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON, MEMORY_SKELETON,
@@ -670,8 +670,8 @@ def grounding_check(observations: str, user_turns: str) -> str:
 
     # LLM fallback (small context) can't handle unbounded user_turns —
     # grounding requires observations + user_turns in one atomic call.
-    # Codex exec (128K) handles full context; fallback truncates to 20K.
-    if not _codex_available() and len(user_turns) > 20000:
+    # Codex exec (128K, LLM_ENGINE=codex) handles full context; HTTP fallback truncates to 20K.
+    if not _codex_enabled() and len(user_turns) > 20000:
         print(f"Grounding: user_turns truncated from {len(user_turns)} to 20000 (LLM fallback)", file=sys.stderr)
         user_turns = user_turns[:20000]
 

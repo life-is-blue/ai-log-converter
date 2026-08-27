@@ -235,9 +235,9 @@ install-cron:
 		exit 1; \
 	fi; \
 	if [ -n "$$codex_bin" ]; then \
-		echo "Cron installed: $$cron_role at $$cron_hour:$$cron_minute, tool PATH resolved (codex: $$codex_bin); logs: /tmp/ai-report.log"; \
+		echo "Cron installed: $$cron_role at $$cron_hour:$$cron_minute, tool PATH resolved (codex: $$codex_bin, opt-in via LLM_ENGINE=codex); logs: /tmp/ai-report.log"; \
 	else \
-		echo "Cron installed: $$cron_role at $$cron_hour:$$cron_minute, tool PATH resolved; codex not found, so configure LLM_API_KEY fallback; logs: /tmp/ai-report.log"; \
+		echo "Cron installed: $$cron_role at $$cron_hour:$$cron_minute, tool PATH resolved; codex not found, ensure LLM_API_KEY is set in .env; logs: /tmp/ai-report.log"; \
 	fi
 
 uninstall-cron:

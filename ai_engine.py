@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Unified LLM engine: codex exec (128K) → call_llm fallback (auto-batch).
+"""Unified LLM engine: HTTP call_llm (default) → codex exec opt-in (128K).
 
 All cmd_* functions in ai_report.py call exactly one function: call_engine().
 This module handles engine selection, context limits, and batching internally.
+
+Engine choice (LLM_ENGINE env): "http" (default) keeps session content on the
+configured LLM_BASE_URL endpoint; "codex" routes full content through
+`codex exec` — only opt in when that is acceptable for the data at hand.
 """
 
 import json, os, re, shutil, subprocess, sys, time
@@ -106,8 +110,9 @@ def _call_codex(content: str, system: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def _codex_available() -> bool:
-    return shutil.which("codex") is not None
+def _codex_enabled() -> bool:
+    """True only when LLM_ENGINE=codex is explicitly set AND the CLI exists."""
+    return os.environ.get("LLM_ENGINE", "http").strip().lower() == "codex" and shutil.which("codex") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +123,8 @@ def call_engine(content: str, system: str, max_tokens: int = 4000, allow_chunkin
     """Unified LLM call. All cmd_* functions use this and only this.
 
     Strategy:
-      1. codex exec available? → 128K context, single call, full content
-      2. fallback → call_llm with auto-batching for small-context models
+      1. LLM_ENGINE=codex (opt-in) → codex exec, 128K context, single call
+      2. default → call_llm with auto-batching for small-context models
 
     allow_chunking=False disables the auto-batch split-and-join fallback below.
     Only safe to leave True for prompts that extract independent per-chunk items
@@ -128,7 +133,7 @@ def call_engine(content: str, system: str, max_tokens: int = 4000, allow_chunkin
     holistic rewrite/persona synthesis) MUST pass allow_chunking=False, or a
     chunked call produces N complete-but-conflicting documents joined together.
     """
-    if _codex_available():
+    if _codex_enabled():
         result = _call_codex(content, system)
         if result:
             return result

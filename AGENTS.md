@@ -114,6 +114,7 @@ Ten subcommands. Config via `.env` (auto-loaded):
 LLM_API_KEY=xxx
 LLM_BASE_URL=http://...          # optional
 LLM_MODEL_NAME=glm-5             # optional
+LLM_ENGINE=http                  # optional: http (default, content stays on LLM_BASE_URL) | codex (opt-in, routes content through Codex backend)
 WECOM_WEBHOOK_URL=https://...    # optional, for push
 ```
 
