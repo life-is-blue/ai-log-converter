@@ -3,6 +3,9 @@
 Tests call production code directly — no logic duplication.
 """
 
+import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -11,6 +14,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 # Ensure we can import from project root
 import sys
@@ -45,6 +49,8 @@ from ai_report import (
     _report_month_dir,
     _truncate_utf8,
     _repo_web_url,
+    _wecom_send,
+    cmd_alert,
     WECOM_MAX_BYTES,
 )
 from ai_prompts import MEMORY_SKELETON
@@ -706,6 +712,75 @@ class TestRepoWebUrl(unittest.TestCase):
     def test_no_git_repo_returns_none(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(_repo_web_url(Path(d), "reports/x.md"))
+
+
+class TestWecomSend(unittest.TestCase):
+    """_wecom_send is the shared transport for push and alert; a 200 response
+    carrying errcode != 0 means WeCom silently dropped the message."""
+
+    def test_missing_webhook_returns_false(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_wecom_send("body", "Push"))
+
+    def test_errcode_zero_is_success(self):
+        resp = mock.MagicMock()
+        resp.read.return_value = b'{"errcode":0,"errmsg":"ok"}'
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.dict(os.environ, {"WECOM_WEBHOOK_URL": "https://example.com/h"}), \
+             mock.patch("ai_report.urlopen", return_value=resp):
+            self.assertTrue(_wecom_send("body", "Push"))
+
+    def test_nonzero_errcode_is_failure(self):
+        resp = mock.MagicMock()
+        resp.read.return_value = b'{"errcode":40058,"errmsg":"invalid content"}'
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.dict(os.environ, {"WECOM_WEBHOOK_URL": "https://example.com/h"}), \
+             mock.patch("ai_report.urlopen", return_value=resp), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertFalse(_wecom_send("body", "Push"))
+        self.assertIn("40058", err.getvalue())
+
+    def test_network_error_is_failure_not_raise(self):
+        with mock.patch.dict(os.environ, {"WECOM_WEBHOOK_URL": "https://example.com/h"}), \
+             mock.patch("ai_report.urlopen", side_effect=OSError("connection refused")), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(_wecom_send("body", "Push"))
+
+
+class TestCmdAlert(unittest.TestCase):
+    """A silent cron failure stalled the pipeline for 3 days; alert makes the
+    failure visible. It must never raise, or it would mask the real failure."""
+
+    def _args(self, stage, log=None):
+        return argparse.Namespace(stage=stage, log=log)
+
+    def test_message_names_stage_and_quotes_log_tail(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "cron.log"
+            log.write_text("early noise\n" + "\n".join(f"line{i}" for i in range(50))
+                           + "\nERROR: ai-memory has tracked local changes\n")
+            with mock.patch("ai_report._wecom_send", return_value=True) as send, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                cmd_alert(self._args("pull-memory", str(log)))
+            body = send.call_args[0][0]
+        self.assertIn("pull-memory", body)
+        self.assertIn("tracked local changes", body)
+        # Tail only — early lines must not be quoted
+        self.assertNotIn("early noise", body)
+        self.assertLessEqual(len(body.encode("utf-8")), WECOM_MAX_BYTES)
+
+    def test_unreadable_log_still_alerts(self):
+        with mock.patch("ai_report._wecom_send", return_value=True) as send, \
+             contextlib.redirect_stderr(io.StringIO()):
+            cmd_alert(self._args("harvest", "/nonexistent/path.log"))
+        self.assertIn("harvest", send.call_args[0][0])
+
+    def test_send_failure_does_not_raise(self):
+        with mock.patch("ai_report._wecom_send", return_value=False), \
+             contextlib.redirect_stderr(io.StringIO()):
+            cmd_alert(self._args("soul"))  # must not raise
 
 
 class TestReportMonthDir(unittest.TestCase):

@@ -187,24 +187,32 @@ pull-memory:
 	fi
 	@git -C '$(LOGS)' pull --rebase --quiet
 
+# Cron redirects all output here; alerts quote its tail so a WeCom message is
+# actionable without SSH-ing in to read the log.
+CRON_LOG ?= /tmp/ai-report.log
+
 # Collectors may run on many machines: gather uniquely named raw sessions only.
 collector:
-	@$(MAKE) pull-memory
-	@$(MAKE) harvest
-	@$(MAKE) sync-memory
+	@alert() { python3 ai_report.py alert --stage "$$1" --log '$(CRON_LOG)' || true; }; \
+	for stage in pull-memory harvest sync-memory; do \
+		$(MAKE) $$stage || { alert "$$stage"; exit 1; }; \
+	done
 
 # Exactly one leader generates shared derived knowledge. Raw logs are synced
 # first; independently completed derived stages are synced even if a later one
-# fails, preserving the existing fail-visible cron behavior.
+# fails, preserving the existing fail-visible cron behavior. Every failure also
+# raises a WeCom alert — a silent cron failure stalled the pipeline for 3 days.
 leader:
-	@$(MAKE) pull-memory
-	@$(MAKE) harvest
-	@$(MAKE) sync-memory
-	@pipeline_rc=0; \
-	{ $(MAKE) report && $(MAKE) push && $(MAKE) soul && $(MAKE) dream && \
-	  $(MAKE) lessons && $(MAKE) distill && $(MAKE) gene-health && $(MAKE) daily; \
-	} || pipeline_rc=$$?; \
-	$(MAKE) sync-memory || exit $$?; \
+	@alert() { python3 ai_report.py alert --stage "$$1" --log '$(CRON_LOG)' || true; }; \
+	for stage in pull-memory harvest sync-memory; do \
+		$(MAKE) $$stage || { alert "$$stage"; exit 1; }; \
+	done; \
+	pipeline_rc=0; failed=""; \
+	for stage in report push soul dream lessons distill gene-health daily; do \
+		$(MAKE) $$stage || { pipeline_rc=$$?; failed="$$stage"; break; }; \
+	done; \
+	$(MAKE) sync-memory || { alert sync-memory; exit 1; }; \
+	[ -z "$$failed" ] || alert "$$failed"; \
 	exit $$pipeline_rc
 
 CRON_ROLE ?= leader

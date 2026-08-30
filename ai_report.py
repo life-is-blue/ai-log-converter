@@ -21,7 +21,7 @@ Config via .env (auto-loaded):
   WECOM_WEBHOOK_URL     WeCom group robot webhook (optional, for push)
   AI_LOGS_DIR           Memory directory (default: ./ai-memory)
 """
-import argparse, hashlib, json, os, re, subprocess, sys
+import argparse, hashlib, json, os, platform, re, subprocess, sys
 from collections import deque
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1911,10 +1911,34 @@ def _repo_web_url(logs_dir: Path, rel_path: str) -> str | None:
     return f"https://{host}/{slug}/-/blob/main/{rel_path}"
 
 
-def cmd_push(args):
-    """Push latest report to WeCom group webhook."""
+def _wecom_send(markdown: str, label: str) -> bool:
+    """Post a markdown message to the WeCom webhook. Returns True on success.
+
+    Shared by cmd_push and cmd_alert: both need the same errcode check, because
+    a 200 response with errcode != 0 means WeCom silently dropped the message.
+    """
     webhook = os.environ.get("WECOM_WEBHOOK_URL")
     if not webhook:
+        print(f"WECOM_WEBHOOK_URL not set, skip {label}", file=sys.stderr)
+        return False
+    body = json.dumps({"msgtype": "markdown", "markdown": {"content": markdown}}).encode()
+    req = Request(webhook, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"{label} failed: {e}", file=sys.stderr)
+        return False
+    if result.get("errcode", 0) != 0:
+        print(f"{label} failed: WeCom rejected ({result.get('errcode')}: {result.get('errmsg')})",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_push(args):
+    """Push latest report to WeCom group webhook."""
+    if not os.environ.get("WECOM_WEBHOOK_URL"):
         print("WECOM_WEBHOOK_URL not set, skip push", file=sys.stderr); return
     logs_dir = Path(args.logs)
     reports_dir = logs_dir / "reports"
@@ -1932,17 +1956,45 @@ def cmd_push(args):
         footer = f"\n\n...\n\n> 完整日报: {web_url}" if web_url else "\n\n...\n\n> 完整日报见服务器"
         footer_bytes = len(footer.encode("utf-8"))
         report_text = _truncate_utf8(report_text, WECOM_MAX_BYTES - footer_bytes) + footer
-    body = json.dumps({"msgtype": "markdown", "markdown": {"content": report_text}}).encode()
-    req = Request(webhook, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        if result.get("errcode", 0) != 0:
-            print(f"Push failed: WeCom rejected ({result.get('errcode')}: {result.get('errmsg')})", file=sys.stderr)
-        else:
-            print(f"Pushed {reports[0].name} to WeCom", file=sys.stderr)
-    except Exception as e:
-        print(f"Push failed: {e}", file=sys.stderr)
+    if _wecom_send(report_text, "Push"):
+        print(f"Pushed {reports[0].name} to WeCom", file=sys.stderr)
+
+
+def cmd_alert(args):
+    """Report a failed pipeline stage to WeCom so cron failures are not silent.
+
+    Called by the Makefile when a leader/collector stage exits non-zero. Always
+    exits 0: an alert that fails must not mask the original failure, and must
+    not turn a one-stage failure into a second red line in the cron log.
+    """
+    stage = args.stage
+    tail = ""
+    if args.log:
+        log_path = Path(args.log)
+        try:
+            # Read the tail only — cron logs grow unboundedly (61KB and counting).
+            with log_path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 4000))
+                tail = fh.read().decode("utf-8", errors="ignore")
+        except OSError as e:
+            tail = f"(log unreadable: {e})"
+        tail = "\n".join(tail.splitlines()[-12:])
+
+    host = os.environ.get("HOSTNAME") or platform.node() or "unknown-host"
+    lines = [
+        f"## ⚠️ ai-distillery 流水线失败",
+        f"**阶段**: `{stage}`",
+        f"**主机**: {host}",
+        f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    if tail.strip():
+        lines += ["", "**日志尾部**:", "```", tail.strip(), "```"]
+    lines += ["", "> 未修复前后续阶段不会产出，知识库将停止更新。"]
+    text = _truncate_utf8("\n".join(lines), WECOM_MAX_BYTES)
+    if _wecom_send(text, "Alert"):
+        print(f"Alert sent for stage '{stage}'", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -3309,12 +3361,15 @@ def main():
     iv.add_argument("--tool", default=None)
     iv.add_argument("--samples", type=int, default=8)
     iv.add_argument("--json-only", action="store_true")
+    al = sub.add_parser("alert")
+    al.add_argument("--stage", required=True, help="pipeline stage that failed")
+    al.add_argument("--log", default=None, help="log file whose tail to include")
     args = p.parse_args()
     {"report": cmd_report, "soul": cmd_soul, "push": cmd_push,
      "distill": cmd_distill, "lessons": cmd_lessons,
      "gene-health": cmd_gene_health, "daily": cmd_daily,
      "sync-memory": cmd_sync_memory, "interventions": cmd_interventions,
-     "dream": cmd_dream}[args.cmd](args)
+     "dream": cmd_dream, "alert": cmd_alert}[args.cmd](args)
 
 
 if __name__ == "__main__":

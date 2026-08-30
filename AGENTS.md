@@ -42,8 +42,8 @@ scripts/extract-gene.sh plan-before-act
 | `make harvest` | Convert sessions from ~/.gemini (Gemini/Agy), ~/.claude-internal, ~/.tclaude, ~/.codebuddy, ~/.codex, ~/.cursor → ai-memory/. All tools land in `ai-memory/<tool>/<project>/<session>`; codex project from session_meta cwd, agy from run_command Cwd, `default` when no hint |
 | `make migrate-flat-sessions` | One-time: git mv legacy flat `codex/default/`, `agy/default/` sessions into project dirs (probed from local sources; commit via sync-memory). Run once per machine after upgrading, then `make sync-memory` |
 | `make pull-memory` | Rebase-pull ai-memory; refuses if it has tracked local changes (sync first) |
-| `make collector` | Collector role: pull-memory → harvest → sync-memory. Raw logs only, no LLM |
-| `make leader` | Leader role: collector steps + full distillation chain. Exactly one machine runs this |
+| `make collector` | Collector role: pull-memory → harvest → sync-memory. Raw logs only, no LLM. Any failed stage posts a WeCom alert |
+| `make leader` | Leader role: collector steps + full distillation chain. Exactly one machine runs this. Any failed stage posts a WeCom alert (override log path via `CRON_LOG`) |
 | `make report` | Generate yesterday's daily report |
 | `make push` | Push latest report to WeCom webhook |
 | `make soul` | Full-context SOUL.md observation extraction (4 categories: Identity/Preferences/Patterns/Context) |
@@ -88,6 +88,9 @@ Raw logs are written by many, derived knowledge by exactly one:
   (`report → push → soul → dream → lessons → distill → gene-health → daily`) and a final sync.
   Independently completed stages still sync even if a later stage fails.
 
+Any failing stage posts a WeCom alert (stage, host, log tail) and still exits non-zero: a silent
+`pull-memory` failure once stalled the whole chain for 3 days with no visible signal.
+
 Running two leaders would make them fight over the same derived files (SOUL/MEMORY/LESSONS/AGENTS).
 `sync-memory` retries a rebase when the remote advanced, which covers concurrent collectors.
 
@@ -107,7 +110,7 @@ that machine runs the same sequence; the repos converge via git renames.
 
 ## ai_report.py
 
-Ten subcommands. Config via `.env` (auto-loaded):
+Eleven subcommands. Config via `.env` (auto-loaded):
 
 ```bash
 # .env
@@ -128,6 +131,7 @@ WECOM_WEBHOOK_URL=https://...    # optional, for push
 - `daily [--date YYYY-MM-DD] [--strict]` — daily health report: knowledge summary, promotion candidates, duplicate detection, rule freshness, pipeline health (no LLM). `--strict` exits 1 if any open findings remain (CI/local enforcement); default stays soft for the cron chain
 - `interventions [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--tool NAME] [--samples N] [--json-only]` — mine where the user takes over from the agent → autonomy baseline. Emits `reports/YYYY/MM/interventions-{range}.json` as SSOT plus a rendered `.md`. Mechanical, no LLM. Per-tool hard markers only (cursor/gemini uncovered — reported as such, never as zero interventions); rates are reported per tool because a single global number is dominated by tool mix
 - `sync-memory [--logs DIR]` — commit and push ai-memory/ to ai-memory remote
+- `alert --stage NAME [--log FILE]` — post a pipeline-failure notice (stage, host, time, log tail) to WeCom. Called by the Makefile when a leader/collector stage fails; always exits 0 so it never masks the original failure
 
 ## Taste Rules
 

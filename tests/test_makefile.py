@@ -274,5 +274,95 @@ class InstallCronTests(unittest.TestCase):
             self.assertIn("ERROR: failed to install cron", failed.stderr)
 
 
+class PipelineAlertTests(unittest.TestCase):
+    """A failing cron stage was silent for 3 days; leader/collector must raise a
+    WeCom alert naming the stage that failed, and must still exit non-zero."""
+
+    def _run_role(self, tmp_path: Path, role: str, failing_stage: str):
+        """Run the real `make <role>` with a fake python3/git shimmed in.
+
+        The real recipes all delegate to `python3 ai_report.py <cmd>` or git, so
+        stubbing those two binaries exercises the actual orchestration (including
+        the `$(MAKE) <stage>` recursion, which an override-Makefile approach
+        would bypass) without any LLM call or network send.
+
+        The fake python3 fails for `failing_stage`'s subcommand, and records
+        every `alert --stage X` invocation instead of posting to WeCom.
+        """
+        alert_log = tmp_path / "alerts.txt"
+        # Stage name -> ai_report.py subcommand it runs. harvest/pull-memory use
+        # the converter/git rather than a subcommand, so they key off argv[1].
+        stage_cmd = {
+            "sync-memory": "sync-memory", "report": "report", "push": "push",
+            "soul": "soul", "dream": "dream", "lessons": "lessons",
+            "distill": "distill", "gene-health": "gene-health", "daily": "daily",
+        }
+        fail_cmd = stage_cmd.get(failing_stage, "")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        fake_python = bin_dir / "python3"
+        fake_python.write_text(
+            "#!/bin/sh\n"
+            "# argv: ai_report.py <subcommand> ... (or -c ... for inline snippets)\n"
+            "sub=\"$2\"\n"
+            "if [ \"$sub\" = alert ]; then\n"
+            "  stage=\"\"\n"
+            "  while [ $# -gt 0 ]; do\n"
+            "    [ \"$1\" != --stage ] || { shift; stage=\"$1\"; }\n"
+            "    shift\n"
+            "  done\n"
+            f"  echo \"$stage\" >> '{alert_log}'\n"
+            "  exit 0\n"
+            "fi\n"
+            f"[ \"$sub\" != '{fail_cmd}' ] || exit 1\n"
+            "exit 0\n"
+        )
+        fake_python.chmod(0o755)
+        # pull-memory / harvest are git- and converter-driven; fail them via git.
+        fake_git = bin_dir / "git"
+        git_rc = 1 if failing_stage in ("pull-memory", "harvest") else 0
+        fake_git.write_text(f"#!/bin/sh\nexit {git_rc}\n")
+        fake_git.chmod(0o755)
+
+        # pull-memory's first check is `test -d $(LOGS)/.git`, which no shim can
+        # satisfy — the directory has to actually exist.
+        logs_dir = tmp_path / "memory"
+        (logs_dir / ".git").mkdir(parents=True)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        result = subprocess.run(
+            ["make", role, f"CRON_LOG={tmp_path / 'cron.log'}",
+             f"LOGS={logs_dir}"],
+            cwd=ROOT, env=env, capture_output=True, text=True,
+        )
+        alerts = alert_log.read_text().split() if alert_log.exists() else []
+        return result, alerts
+
+    def test_leader_alerts_on_early_stage_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, alerts = self._run_role(Path(tmp), "leader", "pull-memory")
+        self.assertNotEqual(result.returncode, 0, "failure must stay visible to cron")
+        self.assertEqual(alerts, ["pull-memory"])
+
+    def test_leader_alerts_on_derived_stage_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, alerts = self._run_role(Path(tmp), "leader", "soul")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(alerts, ["soul"])
+
+    def test_leader_success_sends_no_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, alerts = self._run_role(Path(tmp), "leader", None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(alerts, [])
+
+    def test_collector_alerts_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, alerts = self._run_role(Path(tmp), "collector", "sync-memory")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(alerts, ["sync-memory"])
+
+
 if __name__ == "__main__":
     unittest.main()
