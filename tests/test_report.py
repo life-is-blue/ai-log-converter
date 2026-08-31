@@ -1306,12 +1306,18 @@ class TestWeeklyDeltaHelpers(unittest.TestCase):
 
 class TestCmdWeekly(unittest.TestCase):
     def _setup_logs(self, logs: Path):
-        # One session active on two in-window days, one outside.
+        # One session active on two in-window days, one outside, in "proj";
+        # 16 one-session noise projects to exercise the top-N + aggregate tail.
         for name, ts in [("s1", "2026-08-25T10:00:00"), ("s2", "2026-08-26T11:00:00"),
                          ("s3", "2026-09-05T10:00:00")]:
             p = logs / "claude" / "proj" / f"{name}.jsonl"
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps({"meta": {"timestamp": ts}}) + "\n", encoding="utf-8")
+        for i in range(16):
+            p = logs / "claude" / f"tmp-noise-{i}" / "s.jsonl"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"meta": {"timestamp": "2026-08-25T10:00:00"}}) + "\n",
+                         encoding="utf-8")
         # Daily reports for two of the week's days.
         rdir = logs / "reports" / "2026" / "08"
         rdir.mkdir(parents=True, exist_ok=True)
@@ -1327,13 +1333,14 @@ class TestCmdWeekly(unittest.TestCase):
             "## new-lesson\n> 2026-08-27 | pk: hot | area: x | type: trap\n**坑**: ...\n",
             encoding="utf-8")
 
-    def test_generates_report_and_pushes(self):
+    def test_generates_report_and_pushes_digest(self):
         with tempfile.TemporaryDirectory() as tmp:
             logs = Path(tmp)
             self._setup_logs(logs)
             sent = {}
+            canned = "## 本周要点\n- 要点甲\n- 要点乙\n\n## 本周工作汇总\n\nLLM 摘要\n"
             with mock.patch.dict(os.environ, {"WECOM_WEBHOOK_URL": "https://example.com/h"}), \
-                 mock.patch("ai_report.call_engine", return_value="## 三、本周工作汇总\n\nLLM 摘要\n") as llm, \
+                 mock.patch("ai_report.call_engine", return_value=canned) as llm, \
                  mock.patch("ai_report._wecom_send", return_value=True) as send:
                 cmd_weekly(argparse.Namespace(date=date(2026, 8, 31), logs=str(logs)))
                 sent["md"] = send.call_args[0][0]
@@ -1341,22 +1348,33 @@ class TestCmdWeekly(unittest.TestCase):
             self.assertTrue(out.exists(), "weekly report file must be written")
             content = out.read_text(encoding="utf-8")
             self.assertIn("周报 2026-08-24 ~ 2026-08-30", content)
-            self.assertIn("| 2026-08-25 | 1 |", content)
-            self.assertIn("| 2026-08-26 | 1 |", content)
+            self.assertIn("| 2026-08-25 | 17 |", content)
             self.assertNotIn("2026-09-05", content)  # out-of-window session excluded
             self.assertIn("本周新增 1 条观察", content)
             self.assertIn("new observation", content)
             self.assertIn("本周有新证据支撑 1 条", content)
             self.assertIn("new-lesson", content)
             self.assertIn("LLM 摘要", content)
+            # File keeps tables but caps the project list at 15 + aggregate tail
+            self.assertIn("| 其他 2 项 | 2 |", content)
             # One atomic synthesis call over the daily reports
             prompt = llm.call_args[0][0]
             self.assertIn("2026-08-25 日报", prompt)
             self.assertIn("2026-08-26 日报", prompt)
             self.assertFalse(llm.call_args.kwargs.get("allow_chunking", True))
-            # Push: WeCom message under byte limit
-            self.assertLessEqual(len(sent["md"].encode("utf-8")), WECOM_MAX_BYTES)
-            self.assertIn("本周知识库变化", sent["md"])
+            # Push is a purpose-built digest: no tables, highlights + counts only
+            md = sent["md"]
+            self.assertLessEqual(len(md.encode("utf-8")), WECOM_MAX_BYTES)
+            self.assertIn("周报 2026-08-24 ~ 2026-08-30", md)
+            self.assertIn("**本周要点**", md)
+            self.assertIn("- 要点甲", md)
+            self.assertIn("工作量: 18 sessions", md.replace("*", ""))
+            self.assertIn("主力项目", md)
+            self.assertIn("其他 13 项", md)
+            self.assertIn("知识库: SOUL +1 · MEMORY 1 条获新证据 · LESSONS +1", md.replace("*", ""))
+            self.assertIn("new observation", md)
+            for table_marker in ("| 日期 |", "| 工具 |", "| 项目 |", "|------|"):
+                self.assertNotIn(table_marker, md, "WeCom renders no tables")
 
     def test_no_webhook_skips_push(self):
         with tempfile.TemporaryDirectory() as tmp:

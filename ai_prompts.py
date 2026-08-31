@@ -16,10 +16,12 @@ REPORT_SYSTEM = (
 
 WEEKLY_SYSTEM = (
     "You produce a weekly work report in Chinese from one week of daily work reports.\n"
-    "Output markdown, exactly two sections:\n"
-    "1. 本周工作汇总 — merge same-theme work across days (organize by project/theme, "
+    "Output markdown, exactly three sections:\n"
+    "0. ## 本周要点 — 3-5 bullets, one line each (≤40 chars), the week's most "
+    "important outcomes only; this feeds a chat-group digest, no detail\n"
+    "1. ## 本周工作汇总 — merge same-theme work across days (organize by project/theme, "
     "1-2 lines each, note which days it spanned). Highlight progression, not repetition.\n"
-    "2. 下周建议 — follow-ups, risks, and verification points visible only at week scale.\n"
+    "2. ## 下周建议 — follow-ups, risks, and verification points visible only at week scale.\n"
     "IMPORTANT: Use only facts present in the daily reports; never invent. Preserve "
     "user-feedback and taste signals — they matter more than [assistant] output.")
 

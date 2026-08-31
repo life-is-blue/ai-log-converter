@@ -2118,6 +2118,8 @@ def cmd_weekly(args):
             project_counts[project] = project_counts.get(project, 0) + 1
         except (ValueError, IndexError):
             pass
+    top_projects = sorted(project_counts.items(), key=lambda x: -x[1])
+    shown_projects, tail_projects = top_projects[:15], top_projects[15:]
 
     # ── Mechanical: knowledge delta from date tags ──
     def _read(name: str) -> str:
@@ -2144,8 +2146,10 @@ def cmd_weekly(args):
         lines.append("")
     if project_counts:
         lines.append("| 项目 | session 数 |\n|------|----------|")
-        for t, c in sorted(project_counts.items(), key=lambda x: -x[1]):
+        for t, c in shown_projects:
             lines.append(f"| {t} | {c} |")
+        if tail_projects:
+            lines.append(f"| 其他 {len(tail_projects)} 项 | {sum(c for _, c in tail_projects)} |")
         lines.append("")
 
     lines.append("## 二、本周知识库变化\n")
@@ -2170,6 +2174,7 @@ def cmd_weekly(args):
                 text = _truncate_utf8(text, WEEKLY_MAX_REPORT_CHARS) + "\n\n...(当日日报截断)"
             parts.append(f"## {d} 日报\n\n{text}")
         d += timedelta(days=1)
+    summary = ""
     if parts:
         summary = call_engine("\n\n---\n\n".join(parts), WEEKLY_SYSTEM, allow_chunking=False)
         lines.append(summary.rstrip() + "\n")
@@ -2180,17 +2185,48 @@ def cmd_weekly(args):
     out_path.write_text(content, encoding="utf-8")
     print(f"OK {out_path} ({start} ~ {end}, {total} sessions)", file=sys.stderr)
 
-    # ── Push: knowledge delta is the point; truncate with full-file link ──
+    # ── Push: a WeCom digest, NOT the truncated file ──
+    # WeCom markdown renders no tables, and truncating the full report mid-entry
+    # produced unreadable messages. The file keeps everything; the digest is a
+    # purpose-built compact summary that links to it.
     if not os.environ.get("WECOM_WEBHOOK_URL"):
         return
     if total == 0 and not soul_new and not lesson_new and not mem_fresh:
         print("Weekly: nothing happened this week, skip push", file=sys.stderr)
         return
-    text = content
-    if len(text.encode("utf-8")) > WECOM_MAX_BYTES:
-        web_url = _repo_web_url(logs_dir, out_path.relative_to(logs_dir).as_posix())
-        footer = f"\n\n...\n\n> 完整周报: {web_url}" if web_url else "\n\n...\n\n> 完整周报见服务器"
-        text = _truncate_utf8(text, WECOM_MAX_BYTES - len(footer.encode("utf-8"))) + footer
+
+    def _md_section(md: str, title: str) -> str:
+        m = re.search(rf'^#{{1,3}}\s*{title}\s*\n(.*?)(?=^#\s|\Z)', md, re.S | re.M)
+        return m.group(1).strip() if m else ""
+
+    digest = [f"## 📋 周报 {start} ~ {end}", ""]
+    if summary:
+        bullets = [l.strip()[2:].strip() for l in _md_section(summary, "本周要点").splitlines()
+                   if l.strip().startswith("- ")]
+        if bullets:
+            digest.append("**本周要点**")
+            digest += [f"- {b}" for b in bullets[:5]]
+            digest.append("")
+    top_tools = sorted(tool_counts.items(), key=lambda x: -x[1])[:4]
+    if total or top_tools:
+        tools_txt = " / ".join(f"{t} {c}" for t, c in top_tools)
+        digest.append(f"**工作量**: {total} sessions" + (f" · {tools_txt}" if tools_txt else ""))
+        digest.append("")
+    if top_projects:
+        head = " · ".join(f"{p} {c}" for p, c in top_projects[:4])
+        rest_n = len(top_projects) - 4
+        rest = f" · 其他 {rest_n} 项" if rest_n > 0 else ""
+        digest.append(f"**主力项目**: {head}{rest}")
+        digest.append("")
+    digest.append(f"**知识库**: SOUL +{len(soul_new)} · MEMORY {len(mem_fresh)} 条获新证据 · LESSONS +{len(lesson_new)}")
+    if soul_new:
+        examples = "、".join(_truncate_utf8(e, 48) for e in soul_new[:3])
+        digest.append(f"- 新观察示例: {examples}")
+    digest.append("")
+    web_url = _repo_web_url(logs_dir, out_path.relative_to(logs_dir).as_posix())
+    if web_url:
+        digest.append(f"> [完整周报]({web_url})")
+    text = _truncate_utf8("\n".join(digest), WECOM_MAX_BYTES)
     if _wecom_send(text, "Weekly push"):
         print(f"Pushed weekly {start} to WeCom", file=sys.stderr)
 
