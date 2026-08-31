@@ -33,7 +33,7 @@ from ai_prompts import (
     REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
     LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON, MEMORY_SKELETON,
     SOUL_DEDUP_SYSTEM, MEMORY_DEDUP_SYSTEM, AGENTS_SYSTEM, GENE_REVIEW_SYSTEM,
-    INTERACTION_SYSTEM,
+    INTERACTION_SYSTEM, WEEKLY_SYSTEM,
 )
 
 
@@ -1998,6 +1998,204 @@ def cmd_alert(args):
 
 
 # ---------------------------------------------------------------------------
+# cmd_weekly — weekly report: mechanical stats + knowledge delta + LLM summary
+# ---------------------------------------------------------------------------
+
+# Per-day cap when feeding daily reports into the weekly synthesis. One atomic
+# call (allow_chunking=False) — a week of partial summaries concatenated would
+# contradict each other. 7 × 6000 chars stays within one HTTP context.
+WEEKLY_MAX_REPORT_CHARS = 6000
+
+
+def _last_complete_week(ref: date) -> tuple[date, date]:
+    """Most recent finished Mon–Sun week, ending strictly before `ref`.
+
+    Run on Monday → last week. Run midweek or Sunday → still last week: the
+    current week is not finished, so it must not be summarized yet.
+    """
+    d = ref - timedelta(days=1)
+    while d.weekday() != 6:  # 6 = Sunday
+        d -= timedelta(days=1)
+    return d - timedelta(days=6), d
+
+
+def _entries_in_window(content: str, start: date, end: date) -> list[str]:
+    """One-line summaries of observation entries tagged new:/absorbed: in-window.
+
+    Under the leader chain, distill rewrites `new: D` → `absorbed: D` the same
+    day, so both tags mean "produced on D". Multi-line entries (Why:/How:
+    continuations) contribute only their first line.
+    """
+    out = []
+    for line in content.splitlines():
+        s = line.strip()
+        if not s.startswith("- "):
+            continue
+        m = re.search(r'<!--\s*(?:new|absorbed):\s*(\d{4}-\d{2}-\d{2})\s*-->', s)
+        if not m or not (start <= date.fromisoformat(m.group(1)) <= end):
+            continue
+        summary = s[2:].split("| Evidence:")[0].split("<!--")[0].strip()
+        if summary:
+            out.append(summary)
+    return out
+
+
+def _lesson_slugs_in_window(content: str, start: date, end: date) -> list[str]:
+    """Lesson slugs whose `> YYYY-MM-DD | pk: ...` header falls in the window."""
+    out, slug = [], None
+    for line in content.splitlines():
+        m = re.match(r'^##\s+([\w-]+)', line)
+        if m:
+            slug = m.group(1)
+            continue
+        m = re.match(r'^>\s*(\d{4}-\d{2}-\d{2})\s*\|', line)
+        if m and slug and start <= date.fromisoformat(m.group(1)) <= end:
+            out.append(slug)
+    return out
+
+
+def _rules_with_week_evidence(soul: str, lessons: str, memory: str,
+                              start: date, end: date) -> list[str]:
+    """MEMORY rules whose pk tag has SOUL/LESSONS evidence dated in-window.
+
+    MEMORY rules carry no dates themselves — freshness comes from pk
+    association — so "new rules this week" is not computable. Rules whose
+    evidence recurred this week is the honest, computable signal.
+    """
+    pk_dates: dict[str, set[date]] = {}
+    for line in soul.splitlines():
+        pk = re.search(r'<!--\s*pk:\s*([\w-]+)\s*-->', line)
+        if not pk:
+            continue
+        dt = (re.search(r'<!--\s*new:\s*(\d{4}-\d{2}-\d{2})\s*-->', line)
+              or re.search(r'<!--\s*absorbed:\s*(\d{4}-\d{2}-\d{2})\s*-->', line))
+        if dt:
+            pk_dates.setdefault(pk.group(1), set()).add(date.fromisoformat(dt.group(1)))
+    for line in lessons.splitlines():
+        m = re.match(r'^>\s*(\d{4}-\d{2}-\d{2})\s*\|\s*pk:\s*([\w-]+)', line)
+        if m:
+            pk_dates.setdefault(m.group(2), set()).add(date.fromisoformat(m.group(1)))
+    out = []
+    for line in memory.splitlines():
+        pk = re.search(r'<!--\s*pk:\s*([\w-]+)\s*-->', line)
+        if not pk:
+            continue
+        if any(start <= d <= end for d in pk_dates.get(pk.group(1), ())):
+            summary = line.strip()[2:].split("<!--")[0].strip()
+            if summary:
+                out.append(summary)
+    return out
+
+
+def cmd_weekly(args):
+    """Weekly report: last finished Mon–Sun week. Stats and knowledge delta are
+    mechanical; the work summary is one atomic LLM call over the week's daily
+    reports. Pushes to WeCom when a webhook is configured (the whole point of
+    the weekly cadence — soul/memory changes land in the group, not just files)."""
+    logs_dir = Path(args.logs)
+    ref = args.date or date.today()
+    start, end = _last_complete_week(ref)
+    reports_dir = logs_dir / "reports"
+    month_dir = _report_month_dir(reports_dir, start)
+    month_dir.mkdir(parents=True, exist_ok=True)
+    out_path = month_dir / f"weekly-{start}.md"
+
+    # ── Mechanical: sessions per day + tool/project distribution over the week ──
+    per_day: dict[date, int] = {}
+    tool_counts, project_counts = {}, {}
+    total = 0
+    for p in find_sessions(logs_dir):
+        days = [d for d in session_days(p) if start <= d <= end]
+        if not days:
+            continue
+        total += 1
+        for d in days:
+            per_day[d] = per_day.get(d, 0) + 1
+        try:
+            rel = p.relative_to(logs_dir).parts
+            tool_counts[rel[0]] = tool_counts.get(rel[0], 0) + 1
+            project = rel[1] if len(rel) > 1 else "unknown"
+            project_counts[project] = project_counts.get(project, 0) + 1
+        except (ValueError, IndexError):
+            pass
+
+    # ── Mechanical: knowledge delta from date tags ──
+    def _read(name: str) -> str:
+        p = logs_dir / name
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+    soul_c, memory_c, lessons_c = _read("SOUL.md"), _read("MEMORY.md"), _read("LESSONS.md")
+    soul_new = _entries_in_window(soul_c, start, end)
+    lesson_new = _lesson_slugs_in_window(lessons_c, start, end)
+    mem_fresh = _rules_with_week_evidence(soul_c, lessons_c, memory_c, start, end)
+    rule_counts = _count_memory_rules(logs_dir / "MEMORY.md")
+    total_rules = sum(rule_counts.values())
+
+    lines = [f"# 周报 {start} ~ {end}\n", "## 一、本周概览\n",
+             "| 日期 | session 数 |\n|------|----------|"]
+    d = start
+    while d <= end:
+        lines.append(f"| {d} | {per_day.get(d, 0)} |")
+        d += timedelta(days=1)
+    lines.append(f"\n**合计 {total} 个 session**\n")
+    if tool_counts:
+        lines.append("| 工具 | session 数 |\n|------|----------|")
+        for t, c in sorted(tool_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"| {t} | {c} |")
+        lines.append("")
+    if project_counts:
+        lines.append("| 项目 | session 数 |\n|------|----------|")
+        for t, c in sorted(project_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"| {t} | {c} |")
+        lines.append("")
+
+    lines.append("## 二、本周知识库变化\n")
+    lines.append(f"- **SOUL.md**: 本周新增 {len(soul_new)} 条观察")
+    for e in soul_new:
+        lines.append(f"  - {e}")
+    lines.append(f"- **MEMORY.md**: 现 {total_rules} 条规则，本周有新证据支撑 {len(mem_fresh)} 条")
+    for e in mem_fresh:
+        lines.append(f"  - {e}")
+    if lesson_new:
+        lines.append(f"- **LESSONS.md**: 本周新增 {len(lesson_new)} 条教训: {', '.join(lesson_new)}")
+    lines.append("")
+
+    # ── LLM: one atomic synthesis over the week's daily reports ──
+    parts = []
+    d = start
+    while d <= end:
+        rp = _report_month_dir(reports_dir, d) / f"{d}.md"
+        if rp.exists():
+            text = rp.read_text(encoding="utf-8")
+            if len(text) > WEEKLY_MAX_REPORT_CHARS:
+                text = _truncate_utf8(text, WEEKLY_MAX_REPORT_CHARS) + "\n\n...(当日日报截断)"
+            parts.append(f"## {d} 日报\n\n{text}")
+        d += timedelta(days=1)
+    if parts:
+        summary = call_engine("\n\n---\n\n".join(parts), WEEKLY_SYSTEM, allow_chunking=False)
+        lines.append(summary.rstrip() + "\n")
+    else:
+        lines.append("## 三、本周工作汇总\n\n本周无日报。\n")
+
+    content = "\n".join(lines)
+    out_path.write_text(content, encoding="utf-8")
+    print(f"OK {out_path} ({start} ~ {end}, {total} sessions)", file=sys.stderr)
+
+    # ── Push: knowledge delta is the point; truncate with full-file link ──
+    if not os.environ.get("WECOM_WEBHOOK_URL"):
+        return
+    if total == 0 and not soul_new and not lesson_new and not mem_fresh:
+        print("Weekly: nothing happened this week, skip push", file=sys.stderr)
+        return
+    text = content
+    if len(text.encode("utf-8")) > WECOM_MAX_BYTES:
+        web_url = _repo_web_url(logs_dir, out_path.relative_to(logs_dir).as_posix())
+        footer = f"\n\n...\n\n> 完整周报: {web_url}" if web_url else "\n\n...\n\n> 完整周报见服务器"
+        text = _truncate_utf8(text, WECOM_MAX_BYTES - len(footer.encode("utf-8"))) + footer
+    if _wecom_send(text, "Weekly push"):
+        print(f"Pushed weekly {start} to WeCom", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # cmd_daily — pure mechanical health report (no LLM)
 # ---------------------------------------------------------------------------
 
@@ -3364,12 +3562,16 @@ def main():
     al = sub.add_parser("alert")
     al.add_argument("--stage", required=True, help="pipeline stage that failed")
     al.add_argument("--log", default=None, help="log file whose tail to include")
+    wk = sub.add_parser("weekly")
+    wk.add_argument("--date", type=date.fromisoformat, default=None,
+                    help="reference date; the report covers the last complete Mon-Sun week before it")
+    wk.add_argument("--logs", default=default_logs)
     args = p.parse_args()
     {"report": cmd_report, "soul": cmd_soul, "push": cmd_push,
      "distill": cmd_distill, "lessons": cmd_lessons,
      "gene-health": cmd_gene_health, "daily": cmd_daily,
      "sync-memory": cmd_sync_memory, "interventions": cmd_interventions,
-     "dream": cmd_dream, "alert": cmd_alert}[args.cmd](args)
+     "dream": cmd_dream, "alert": cmd_alert, "weekly": cmd_weekly}[args.cmd](args)
 
 
 if __name__ == "__main__":

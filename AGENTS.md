@@ -52,6 +52,7 @@ scripts/extract-gene.sh plan-before-act
 | `make lessons` | Extract lessons learned → LESSONS.md (5 types: trap/toolchain/arch/correction/method) |
 | `make gene-health` | Compute Gene freshness, rebuild registry, output health report |
 | `make daily` | Generate daily health report (9 sections, pure mechanical, no LLM) |
+| `make weekly` | Weekly report for the last finished Mon–Sun week: mechanical stats + knowledge delta (SOUL/MEMORY/LESSONS) + LLM work summary; pushes to WeCom when configured. Leader runs it automatically on Mondays |
 | `make interventions` | Mine user intervention points → autonomy baseline (mechanical; not in cron) |
 | `make sync-memory` | Commit and push ai-memory/ to ai-memory remote |
 | `make setup` | New machine deployment: check Python, create .env, verify imports, install cron |
@@ -85,8 +86,8 @@ Raw logs are written by many, derived knowledge by exactly one:
 - **collector** (any number of machines) — `pull-memory → harvest → sync-memory`. Each machine only
   contributes uniquely-named raw session files, so concurrent writes never collide. No LLM needed.
 - **leader** (exactly one machine) — collector steps, then the full chain
-  (`report → push → soul → dream → lessons → distill → gene-health → daily`) and a final sync.
-  Independently completed stages still sync even if a later stage fails.
+  (`report → push → soul → dream → lessons → distill → gene-health → daily`, plus `weekly` on Mondays)
+  and a final sync. Independently completed stages still sync even if a later stage fails.
 
 Any failing stage posts a WeCom alert (stage, host, log tail) and still exits non-zero: a silent
 `pull-memory` failure once stalled the whole chain for 3 days with no visible signal.
@@ -110,7 +111,7 @@ that machine runs the same sequence; the repos converge via git renames.
 
 ## ai_report.py
 
-Eleven subcommands. Config via `.env` (auto-loaded):
+Twelve subcommands. Config via `.env` (auto-loaded):
 
 ```bash
 # .env
@@ -129,6 +130,7 @@ WECOM_WEBHOOK_URL=https://...    # optional, for push
 - `lessons [--date YYYY-MM-DD] [--lessons FILE]` — extract lessons learned → LESSONS.md (错题本: 坑/因/法 + area tags)
 - `gene-health [--genes-dir DIR]` — compute Gene freshness (decay model), rebuild registry.json, output health report
 - `daily [--date YYYY-MM-DD] [--strict]` — daily health report: knowledge summary, promotion candidates, duplicate detection, rule freshness, pipeline health (no LLM). `--strict` exits 1 if any open findings remain (CI/local enforcement); default stays soft for the cron chain
+- `weekly [--date YYYY-MM-DD]` — weekly report for the last finished Mon–Sun week (mechanical stats + SOUL/MEMORY/LESSONS delta + LLM work summary) → `reports/YYYY/MM/weekly-{start}.md`, pushed to WeCom when configured; empty weeks skip the push
 - `interventions [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--tool NAME] [--samples N] [--json-only]` — mine where the user takes over from the agent → autonomy baseline. Emits `reports/YYYY/MM/interventions-{range}.json` as SSOT plus a rendered `.md`. Mechanical, no LLM. Per-tool hard markers only (cursor/gemini uncovered — reported as such, never as zero interventions); rates are reported per tool because a single global number is dominated by tool mix
 - `sync-memory [--logs DIR]` — commit and push ai-memory/ to ai-memory remote
 - `alert --stage NAME [--log FILE]` — post a pipeline-failure notice (stage, host, time, log tail) to WeCom. Called by the Makefile when a leader/collector stage fails; always exits 0 so it never masks the original failure

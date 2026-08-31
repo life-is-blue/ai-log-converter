@@ -1,4 +1,4 @@
-.PHONY: test clean harvest migrate-flat-sessions pull-memory collector leader report push soul dream distill lessons gene-health daily interventions sync-memory install-cron uninstall-cron backfill-soul setup
+.PHONY: test clean harvest migrate-flat-sessions pull-memory collector leader report push soul dream distill lessons gene-health daily interventions weekly sync-memory install-cron uninstall-cron backfill-soul setup
 
 LOGS     := $(CURDIR)/ai-memory
 CONVERTER := python3 ai_log_converter.py
@@ -176,6 +176,9 @@ daily:
 interventions:
 	@python3 ai_report.py interventions --logs $(LOGS)
 
+weekly:
+	@python3 ai_report.py weekly --logs $(LOGS)
+
 sync-memory:
 	@python3 ai_report.py sync-memory --logs $(LOGS)
 
@@ -208,7 +211,9 @@ leader:
 		$(MAKE) $$stage || { alert "$$stage"; exit 1; }; \
 	done; \
 	pipeline_rc=0; failed=""; \
-	for stage in report push soul dream lessons distill gene-health daily; do \
+	stages="report push soul dream lessons distill gene-health daily"; \
+	if [ "$$(date +%u)" = 1 ]; then stages="$$stages weekly"; fi; \
+	for stage in $$stages; do \
 		$(MAKE) $$stage || { pipeline_rc=$$?; failed="$$stage"; break; }; \
 	done; \
 	$(MAKE) sync-memory || { alert sync-memory; exit 1; }; \

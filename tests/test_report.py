@@ -51,6 +51,11 @@ from ai_report import (
     _repo_web_url,
     _wecom_send,
     cmd_alert,
+    cmd_weekly,
+    _last_complete_week,
+    _entries_in_window,
+    _lesson_slugs_in_window,
+    _rules_with_week_evidence,
     WECOM_MAX_BYTES,
 )
 from ai_prompts import MEMORY_SKELETON
@@ -1244,6 +1249,136 @@ class TestParseMemoryLayers(unittest.TestCase):
         rebuilt = _rebuild_memory("# MEMORY.md\n", layers)
         for section in ("MUST", "MUST NOT", "PREFER", "CONTEXT"):
             self.assertIn(f"## {section}", rebuilt)
+
+
+class TestLastCompleteWeek(unittest.TestCase):
+    """Weekly covers the last FINISHED Mon-Sun week — run midweek or Sunday and
+    it still reports last week, never the week in progress."""
+
+    def test_monday_gets_previous_week(self):
+        self.assertEqual(_last_complete_week(date(2026, 8, 31)), (date(2026, 8, 24), date(2026, 8, 30)))
+
+    def test_sunday_still_previous_week(self):
+        self.assertEqual(_last_complete_week(date(2026, 9, 6)), (date(2026, 8, 24), date(2026, 8, 30)))
+
+    def test_wednesday_still_previous_week(self):
+        self.assertEqual(_last_complete_week(date(2026, 9, 2)), (date(2026, 8, 24), date(2026, 8, 30)))
+
+    def test_tuesday(self):
+        self.assertEqual(_last_complete_week(date(2026, 9, 1)), (date(2026, 8, 24), date(2026, 8, 30)))
+
+
+class TestWeeklyDeltaHelpers(unittest.TestCase):
+    START, END = date(2026, 8, 24), date(2026, 8, 30)
+
+    def test_entries_in_window_both_tag_forms(self):
+        content = (
+            "## Identity\n"
+            "- in-window new | Evidence: \"x\" <!-- new: 2026-08-26 -->\n"
+            "- in-window absorbed | Evidence: \"y\" <!-- absorbed: 2026-08-27 -->\n"
+            "  Why: continuation line must not be a separate entry\n"
+            "- before window <!-- absorbed: 2026-08-23 -->\n"
+            "- after window <!-- absorbed: 2026-08-31 -->\n"
+            "- no tag at all\n"
+            "not an entry: <!-- absorbed: 2026-08-26 -->\n"
+        )
+        got = _entries_in_window(content, self.START, self.END)
+        self.assertEqual(got, ["in-window new", "in-window absorbed"])
+
+    def test_lesson_slugs_in_window(self):
+        content = (
+            "## old-lesson\n> 2026-08-01 | pk: old | area: x | type: trap\n**坑**: ...\n"
+            "## new-lesson\n> 2026-08-27 | pk: new | area: x | type: trap\n**坑**: ...\n"
+        )
+        self.assertEqual(_lesson_slugs_in_window(content, self.START, self.END), ["new-lesson"])
+
+    def test_rules_with_week_evidence(self):
+        soul = "- pattern entry <!-- pk: hot --> <!-- absorbed: 2026-08-26 -->\n"
+        lessons = "## some-lesson\n> 2026-08-01 | pk: cold | area: x | type: trap\n"
+        memory = (
+            "- rule with fresh evidence <!-- pk: hot --> <!-- id: a1 -->\n"
+            "- rule with stale evidence <!-- pk: cold --> <!-- id: b2 -->\n"
+            "- rule without pk <!-- id: c3 -->\n"
+        )
+        got = _rules_with_week_evidence(soul, lessons, memory, self.START, self.END)
+        self.assertEqual(got, ["rule with fresh evidence"])
+
+
+class TestCmdWeekly(unittest.TestCase):
+    def _setup_logs(self, logs: Path):
+        # One session active on two in-window days, one outside.
+        for name, ts in [("s1", "2026-08-25T10:00:00"), ("s2", "2026-08-26T11:00:00"),
+                         ("s3", "2026-09-05T10:00:00")]:
+            p = logs / "claude" / "proj" / f"{name}.jsonl"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"meta": {"timestamp": ts}}) + "\n", encoding="utf-8")
+        # Daily reports for two of the week's days.
+        rdir = logs / "reports" / "2026" / "08"
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / "2026-08-25.md").write_text("# 2026-08-25\n\n做了 A。\n", encoding="utf-8")
+        (rdir / "2026-08-26.md").write_text("# 2026-08-26\n\n做了 B。\n", encoding="utf-8")
+        # Knowledge files with one in-window delta each.
+        (logs / "SOUL.md").write_text(
+            "## Identity\n- new observation <!-- absorbed: 2026-08-26 -->\n", encoding="utf-8")
+        (logs / "MEMORY.md").write_text(
+            "# MEMORY.md\n\n## MUST\n\n### Universal\n- fresh rule <!-- pk: hot --> <!-- id: a1 -->\n",
+            encoding="utf-8")
+        (logs / "LESSONS.md").write_text(
+            "## new-lesson\n> 2026-08-27 | pk: hot | area: x | type: trap\n**坑**: ...\n",
+            encoding="utf-8")
+
+    def test_generates_report_and_pushes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            self._setup_logs(logs)
+            sent = {}
+            with mock.patch.dict(os.environ, {"WECOM_WEBHOOK_URL": "https://example.com/h"}), \
+                 mock.patch("ai_report.call_engine", return_value="## 三、本周工作汇总\n\nLLM 摘要\n") as llm, \
+                 mock.patch("ai_report._wecom_send", return_value=True) as send:
+                cmd_weekly(argparse.Namespace(date=date(2026, 8, 31), logs=str(logs)))
+                sent["md"] = send.call_args[0][0]
+            out = logs / "reports" / "2026" / "08" / "weekly-2026-08-24.md"
+            self.assertTrue(out.exists(), "weekly report file must be written")
+            content = out.read_text(encoding="utf-8")
+            self.assertIn("周报 2026-08-24 ~ 2026-08-30", content)
+            self.assertIn("| 2026-08-25 | 1 |", content)
+            self.assertIn("| 2026-08-26 | 1 |", content)
+            self.assertNotIn("2026-09-05", content)  # out-of-window session excluded
+            self.assertIn("本周新增 1 条观察", content)
+            self.assertIn("new observation", content)
+            self.assertIn("本周有新证据支撑 1 条", content)
+            self.assertIn("new-lesson", content)
+            self.assertIn("LLM 摘要", content)
+            # One atomic synthesis call over the daily reports
+            prompt = llm.call_args[0][0]
+            self.assertIn("2026-08-25 日报", prompt)
+            self.assertIn("2026-08-26 日报", prompt)
+            self.assertFalse(llm.call_args.kwargs.get("allow_chunking", True))
+            # Push: WeCom message under byte limit
+            self.assertLessEqual(len(sent["md"].encode("utf-8")), WECOM_MAX_BYTES)
+            self.assertIn("本周知识库变化", sent["md"])
+
+    def test_no_webhook_skips_push(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            self._setup_logs(logs)
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                 mock.patch("ai_report.call_engine", return_value="x"), \
+                 mock.patch("ai_report._wecom_send", return_value=True) as send:
+                os.environ.pop("WECOM_WEBHOOK_URL", None)
+                cmd_weekly(argparse.Namespace(date=date(2026, 8, 31), logs=str(logs)))
+            send.assert_not_called()
+
+    def test_empty_week_skips_push_but_writes_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            with mock.patch.dict(os.environ, {"WECOM_WEBHOOK_URL": "https://example.com/h"}), \
+                 mock.patch("ai_report._wecom_send", return_value=True) as send, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                cmd_weekly(argparse.Namespace(date=date(2026, 8, 31), logs=str(logs)))
+            send.assert_not_called()
+            out = logs / "reports" / "2026" / "08" / "weekly-2026-08-24.md"
+            self.assertTrue(out.exists())
 
 
 if __name__ == "__main__":

@@ -278,24 +278,28 @@ class PipelineAlertTests(unittest.TestCase):
     """A failing cron stage was silent for 3 days; leader/collector must raise a
     WeCom alert naming the stage that failed, and must still exit non-zero."""
 
-    def _run_role(self, tmp_path: Path, role: str, failing_stage: str):
-        """Run the real `make <role>` with a fake python3/git shimmed in.
+    def _run_role(self, tmp_path: Path, role: str, failing_stage: str, weekday: str = "3"):
+        """Run the real `make <role>` with a fake python3/git/date shimmed in.
 
         The real recipes all delegate to `python3 ai_report.py <cmd>` or git, so
         stubbing those two binaries exercises the actual orchestration (including
         the `$(MAKE) <stage>` recursion, which an override-Makefile approach
         would bypass) without any LLM call or network send.
 
-        The fake python3 fails for `failing_stage`'s subcommand, and records
-        every `alert --stage X` invocation instead of posting to WeCom.
+        The fake python3 fails for `failing_stage`'s subcommand, records every
+        `alert --stage X` invocation instead of posting to WeCom, and logs all
+        subcommands so tests can assert which stages ran. The fake date pins the
+        weekday (date +%u, 1=Monday) for the leader's Monday-only weekly hook.
         """
         alert_log = tmp_path / "alerts.txt"
+        cmd_log = tmp_path / "cmds.txt"
         # Stage name -> ai_report.py subcommand it runs. harvest/pull-memory use
         # the converter/git rather than a subcommand, so they key off argv[1].
         stage_cmd = {
             "sync-memory": "sync-memory", "report": "report", "push": "push",
             "soul": "soul", "dream": "dream", "lessons": "lessons",
             "distill": "distill", "gene-health": "gene-health", "daily": "daily",
+            "weekly": "weekly",
         }
         fail_cmd = stage_cmd.get(failing_stage, "")
         bin_dir = tmp_path / "bin"
@@ -305,6 +309,9 @@ class PipelineAlertTests(unittest.TestCase):
             "#!/bin/sh\n"
             "# argv: ai_report.py <subcommand> ... (or -c ... for inline snippets)\n"
             "sub=\"$2\"\n"
+            "if [ \"$1\" = ai_report.py ]; then\n"
+            f"  echo \"$sub\" >> '{cmd_log}'\n"
+            "fi\n"
             "if [ \"$sub\" = alert ]; then\n"
             "  stage=\"\"\n"
             "  while [ $# -gt 0 ]; do\n"
@@ -318,6 +325,9 @@ class PipelineAlertTests(unittest.TestCase):
             "exit 0\n"
         )
         fake_python.chmod(0o755)
+        fake_date = bin_dir / "date"
+        fake_date.write_text(f"#!/bin/sh\necho {weekday}\n")
+        fake_date.chmod(0o755)
         # pull-memory / harvest are git- and converter-driven; fail them via git.
         fake_git = bin_dir / "git"
         git_rc = 1 if failing_stage in ("pull-memory", "harvest") else 0
@@ -337,29 +347,40 @@ class PipelineAlertTests(unittest.TestCase):
             cwd=ROOT, env=env, capture_output=True, text=True,
         )
         alerts = alert_log.read_text().split() if alert_log.exists() else []
-        return result, alerts
+        cmds = cmd_log.read_text().split() if cmd_log.exists() else []
+        return result, alerts, cmds
 
     def test_leader_alerts_on_early_stage_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result, alerts = self._run_role(Path(tmp), "leader", "pull-memory")
+            result, alerts, _ = self._run_role(Path(tmp), "leader", "pull-memory")
         self.assertNotEqual(result.returncode, 0, "failure must stay visible to cron")
         self.assertEqual(alerts, ["pull-memory"])
 
     def test_leader_alerts_on_derived_stage_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result, alerts = self._run_role(Path(tmp), "leader", "soul")
+            result, alerts, _ = self._run_role(Path(tmp), "leader", "soul")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(alerts, ["soul"])
 
     def test_leader_success_sends_no_alert(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result, alerts = self._run_role(Path(tmp), "leader", None)
+            result, alerts, _ = self._run_role(Path(tmp), "leader", None)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(alerts, [])
 
+    def test_leader_runs_weekly_only_on_monday(self):
+        for weekday, expected in [("1", True), ("3", False)]:
+            with self.subTest(weekday=weekday):
+                with tempfile.TemporaryDirectory() as tmp:
+                    result, alerts, cmds = self._run_role(
+                        Path(tmp), "leader", None, weekday=weekday)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(alerts, [])
+                self.assertEqual("weekly" in cmds, expected)
+
     def test_collector_alerts_on_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result, alerts = self._run_role(Path(tmp), "collector", "sync-memory")
+            result, alerts, _ = self._run_role(Path(tmp), "collector", "sync-memory")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(alerts, ["sync-memory"])
 
