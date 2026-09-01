@@ -11,6 +11,7 @@ configured LLM_BASE_URL endpoint; "codex" routes full content through
 
 import json, os, re, shutil, subprocess, sys, time
 from functools import lru_cache
+from http.client import HTTPException
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -74,8 +75,15 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = None) -> str:
                     continue
             # Non-retryable HTTP error or retries exhausted
             print(f"LLM API error: {e.code} {body}", file=sys.stderr); sys.exit(1)
-        except (URLError, json.JSONDecodeError, KeyError) as e:
-            # Network timeout, connection error, malformed response
+        except (OSError, HTTPException, json.JSONDecodeError, KeyError) as e:
+            # Network timeout, connection error, malformed response.
+            # urllib wraps only CONNECT-phase failures in URLError; read-phase
+            # failures escape raw — TimeoutError (slow model, >180s to first
+            # byte), ConnectionResetError/RemoteDisconnected (proxy dropped),
+            # IncompleteRead (truncated body) — all OSError/HTTPException
+            # subclasses that must retry like any transient error. A bare
+            # TimeoutError once bypassed all retries and killed the whole
+            # lessons stage.
             if attempt < max_retries:
                 delay = 2 ** attempt
                 print(f"LLM transient error retry {attempt+1}/{max_retries} after {delay}s: {type(e).__name__}: {e}", file=sys.stderr)

@@ -1,10 +1,63 @@
 import subprocess
 import unittest
 from contextlib import redirect_stderr
+from http.client import RemoteDisconnected
 from io import StringIO
 from unittest import mock
 
 import ai_engine
+
+
+def _ok_response(content="answer"):
+    import json as _json
+    body = _json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+    resp = mock.MagicMock()
+    resp.read.return_value = body
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = lambda *a: None
+    return resp
+
+
+class CallLlmRetryTests(unittest.TestCase):
+    """Regression: urllib wraps only connect-phase failures in URLError. A
+    read-phase TimeoutError escaped both except clauses, bypassed all retries,
+    and crashed the lessons stage with an unhandled traceback."""
+
+    def _env(self):
+        return mock.patch.dict(ai_engine.os.environ,
+                               {"LLM_API_KEY": "k", "LLM_BASE_URL": "http://x"},
+                               clear=False)
+
+    @mock.patch.object(ai_engine.time, "sleep")
+    @mock.patch.object(ai_engine, "urlopen")
+    def test_read_phase_timeout_is_retried(self, urlopen, sleep):
+        urlopen.side_effect = [TimeoutError("timed out"), _ok_response()]
+        with self._env(), redirect_stderr(StringIO()):
+            result = ai_engine.call_llm("prompt", "sys")
+        self.assertEqual(result, "answer")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    @mock.patch.object(ai_engine.time, "sleep")
+    @mock.patch.object(ai_engine, "urlopen")
+    def test_proxy_disconnect_is_retried(self, urlopen, sleep):
+        # RemoteDisconnected (proxy dropped after connect) is both
+        # ConnectionResetError and BadStatusLine — must retry, not crash.
+        urlopen.side_effect = [RemoteDisconnected("dropped"), _ok_response()]
+        with self._env(), redirect_stderr(StringIO()):
+            result = ai_engine.call_llm("prompt", "sys")
+        self.assertEqual(result, "answer")
+        self.assertEqual(urlopen.call_count, 2)
+
+    @mock.patch.object(ai_engine.time, "sleep")
+    @mock.patch.object(ai_engine, "urlopen")
+    def test_timeout_retries_exhausted_exits_nonzero(self, urlopen, sleep):
+        urlopen.side_effect = TimeoutError("timed out")
+        with self._env(), redirect_stderr(StringIO()), \
+             self.assertRaises(SystemExit) as ctx:
+            ai_engine.call_llm("prompt", "sys")
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertEqual(urlopen.call_count, 4)  # 1 + 3 retries
 
 
 class EngineSelectionTests(unittest.TestCase):
