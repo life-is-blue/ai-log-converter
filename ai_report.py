@@ -21,7 +21,7 @@ Config via .env (auto-loaded):
   WECOM_WEBHOOK_URL     WeCom group robot webhook (optional, for push)
   AI_LOGS_DIR           Memory directory (default: ./ai-memory)
 """
-import argparse, hashlib, json, os, platform, re, subprocess, sys
+import argparse, hashlib, json, os, platform, re, subprocess, sys, time
 from collections import deque
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -3522,6 +3522,23 @@ def cmd_sync_memory(args):
                           cwd=str(logs_dir), check=True, capture_output=True, timeout=30)
             committed = True
 
+        def _local_head() -> str:
+            r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(logs_dir),
+                               capture_output=True, text=True, timeout=10)
+            return r.stdout.strip()
+
+        def _remote_head() -> str | None:
+            """Remote HEAD sha, or None when unreachable within a short timeout."""
+            try:
+                r = subprocess.run(["git", "ls-remote", "origin", "HEAD"], cwd=str(logs_dir),
+                                   capture_output=True, text=True, timeout=20)
+            except (subprocess.TimeoutExpired, OSError):
+                return None
+            if r.returncode != 0:
+                return None
+            parts = r.stdout.split()
+            return parts[0] if parts else None
+
         for attempt in range(3):
             try:
                 subprocess.run(["git", "push"], cwd=str(logs_dir), check=True,
@@ -3531,6 +3548,21 @@ def cmd_sync_memory(args):
                 else:
                     print("sync-memory: no new changes; pending commits pushed", file=sys.stderr)
                 return
+            except subprocess.TimeoutExpired:
+                # Push timeouts are often false negatives: the server updated
+                # the ref but the response never arrived (observed 2026-09-03 —
+                # alert fired, yet remote HEAD already matched local). Verify
+                # before burning another 120s; retry with backoff when real.
+                if _remote_head() == _local_head():
+                    print("OK sync-memory: push confirmed on remote after timeout", file=sys.stderr)
+                    return
+                if attempt < 2:
+                    delay = 5 * (attempt + 1)
+                    print(f"sync-memory: push timeout, retry {attempt + 1}/2 in {delay}s",
+                          file=sys.stderr)
+                    time.sleep(delay)
+                    continue
+                raise
             except subprocess.CalledProcessError as push_error:
                 if attempt == 2 or not is_non_fast_forward(push_error):
                     raise

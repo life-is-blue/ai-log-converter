@@ -5,7 +5,9 @@ from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+import ai_report
 from ai_report import cmd_sync_memory
 
 
@@ -99,6 +101,69 @@ class SyncMemoryConcurrencyTests(unittest.TestCase):
             git(self.local_a, "rev-parse", "HEAD").stdout,
             git(self.remote, "rev-parse", "main").stdout,
         )
+
+
+class SyncMemoryTimeoutTests(SyncMemoryConcurrencyTests):
+    """Regression (2026-09-03): a push TimeoutExpired escaped the retry loop —
+    which only caught CalledProcessError — and killed the whole leader chain,
+    even though the ref had already been updated server-side."""
+
+    def _patch_push(self, mode, max_timeouts=1):
+        """Intercept `git push` only; every other git call runs for real.
+
+        mode="false_negative": push runs to completion, THEN raises
+        TimeoutExpired — server updated the ref, client never heard back.
+        mode="real_timeout": push raises without running (network dead).
+        """
+        real_run = subprocess.run
+        state = {"timeouts": 0}
+
+        def fake_run(*args, **kwargs):
+            if args and args[0][:2] == ["git", "push"]:
+                if state["timeouts"] < max_timeouts:
+                    state["timeouts"] += 1
+                    if mode == "false_negative":
+                        real_run(*args, **kwargs)  # server-side: ref updated
+                    raise subprocess.TimeoutExpired(cmd=list(args[0]), timeout=120)
+            return real_run(*args, **kwargs)
+
+        return mock.patch.object(ai_report.subprocess, "run", side_effect=fake_run)
+
+    def test_false_negative_timeout_confirms_on_remote(self):
+        (self.local_a / "f.md").write_text("x\n")
+        stderr = StringIO()
+        with self._patch_push("false_negative"), redirect_stderr(stderr):
+            cmd_sync_memory(SimpleNamespace(logs=str(self.local_a)))
+
+        self.assertIn("push confirmed on remote after timeout", stderr.getvalue())
+        self.assertEqual(
+            git(self.local_a, "rev-parse", "HEAD").stdout,
+            git(self.remote, "rev-parse", "main").stdout,
+        )
+
+    def test_real_timeout_retries_and_succeeds(self):
+        (self.local_a / "f.md").write_text("x\n")
+        stderr = StringIO()
+        with self._patch_push("real_timeout", max_timeouts=1) as run, \
+             mock.patch.object(ai_report.time, "sleep"), redirect_stderr(stderr):
+            cmd_sync_memory(SimpleNamespace(logs=str(self.local_a)))
+
+        self.assertIn("retry 1/2", stderr.getvalue())
+        self.assertEqual(
+            git(self.local_a, "rev-parse", "HEAD").stdout,
+            git(self.remote, "rev-parse", "main").stdout,
+        )
+
+    def test_persistent_timeout_exits_nonzero(self):
+        (self.local_a / "f.md").write_text("x\n")
+        stderr = StringIO()
+        with self._patch_push("real_timeout", max_timeouts=99), \
+             mock.patch.object(ai_report.time, "sleep"), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                cmd_sync_memory(SimpleNamespace(logs=str(self.local_a)))
+
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn("git operation timed out", stderr.getvalue())
 
 
 if __name__ == "__main__":
